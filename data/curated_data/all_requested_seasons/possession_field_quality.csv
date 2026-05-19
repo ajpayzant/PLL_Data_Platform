@@ -1,0 +1,8 @@
+field,exists,non_null_rows,zero_rows,total_rows,coverage_rate,notes
+time_in_possession,True,0,396,396,0.0,available
+time_in_possession_pct,True,0,396,396,0.0,available
+touches,True,396,0,396,1.0,available
+total_passes,True,396,2,396,1.0,available
+total_possessions,True,396,64,396,1.0,available
+official_total_possessions,True,0,396,396,0.0,available
+offensive_sequence_proxy,True,396,0,396,1.0,available

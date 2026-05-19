@@ -1,0 +1,3 @@
+check_name,status,actual,expected,notes
+team_defense_season_stats_rows,pass,48,,Defensive season rows created.
+non_normal_possession_games,warn,198,0.0,Non-normal possession data games are preserved and labeled.

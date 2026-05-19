@@ -1,0 +1,40 @@
+check_name,status,actual,expected,notes,run_id,checked_at_utc
+event_discovery_2022,pass,52,40,Discovered schedule rows from PLL event APIs.,run_20260519_205906,2026-05-19T20:59:16Z
+event_discovery_2023,pass,48,40,Discovered schedule rows from PLL event APIs.,run_20260519_205906,2026-05-19T20:59:24Z
+event_discovery_2024,pass,47,40,Discovered schedule rows from PLL event APIs.,run_20260519_205906,2026-05-19T20:59:33Z
+event_discovery_2025,pass,47,40,Discovered schedule rows from PLL event APIs.,run_20260519_205906,2026-05-19T20:59:41Z
+event_discovery_2026,pass,54,,Discovered schedule rows from PLL event APIs.,run_20260519_205906,2026-05-19T20:59:51Z
+duplicate_player_game_rows_removed,pass,0,0,Duplicate player-game rows removed by key.,run_20260519_205906,2026-05-19T21:01:22Z
+duplicate_team_game_rows_removed,pass,0,0,Duplicate team-game rows removed by key.,run_20260519_205906,2026-05-19T21:01:22Z
+player_game_stats_rows,pass,7047,,Parsed player-game stat rows.,run_20260519_205906,2026-05-19T21:01:22Z
+team_game_stats_rows,pass,396,,Parsed team-game stat rows.,run_20260519_205906,2026-05-19T21:01:22Z
+clean_player_game_stats_rows,pass,7047,,Clean player-game rows.,run_20260519_205906,2026-05-19T21:01:34Z
+clean_team_game_stats_rows,pass,396,,Clean team-game rows.,run_20260519_205906,2026-05-19T21:01:34Z
+game_manifest_rows,pass,248,,Game manifest rows.,run_20260519_205906,2026-05-19T21:01:34Z
+team_record_wins_losses_match_games,warn,4,0,Team records should be based on final score and sum to games.,run_20260519_205906,2026-05-19T21:01:34Z
+player_save_pct_range,pass,0,0,Goalie save percentages should not exceed 1.0.,run_20260519_205906,2026-05-19T21:01:34Z
+player_ranking_profiles_rows,pass,2079,,Player ranking profiles built.,run_20260519_205906,2026-05-19T21:01:34Z
+player_overall_score_range,pass,0,0,Player overall scores should be between 0 and 100.,run_20260519_205906,2026-05-19T21:01:34Z
+team_style_profiles_rows,pass,62,,Team style profiles built.,run_20260519_205906,2026-05-19T21:01:35Z
+team_style_score_range,pass,0,0,Team style scores should be between 0 and 100.,run_20260519_205906,2026-05-19T21:01:35Z
+clean_game_manifest_exists,pass,248,>0 rows,Required clean table check.,run_20260519_205906,2026-05-19T21:01:35Z
+clean_game_schedule_all_exists,pass,248,>0 rows,Required clean table check.,run_20260519_205906,2026-05-19T21:01:35Z
+clean_player_game_stats_exists,pass,7047,>0 rows,Required clean table check.,run_20260519_205906,2026-05-19T21:01:35Z
+clean_team_game_stats_exists,pass,396,>0 rows,Required clean table check.,run_20260519_205906,2026-05-19T21:01:35Z
+clean_player_directory_exists,pass,375,>0 rows,Required clean table check.,run_20260519_205906,2026-05-19T21:01:35Z
+clean_team_directory_exists,pass,14,>0 rows,Required clean table check.,run_20260519_205906,2026-05-19T21:01:35Z
+marts_player_season_stats_exists,pass,954,>0 rows,Required marts table check.,run_20260519_205906,2026-05-19T21:01:35Z
+marts_player_season_stats_by_team_exists,pass,1043,>0 rows,Required marts table check.,run_20260519_205906,2026-05-19T21:01:35Z
+marts_player_career_stats_exists,pass,375,>0 rows,Required marts table check.,run_20260519_205906,2026-05-19T21:01:35Z
+marts_player_last5_stats_exists,pass,375,>0 rows,Required marts table check.,run_20260519_205906,2026-05-19T21:01:35Z
+marts_player_last10_stats_exists,pass,375,>0 rows,Required marts table check.,run_20260519_205906,2026-05-19T21:01:35Z
+marts_team_season_stats_exists,pass,48,>0 rows,Required marts table check.,run_20260519_205906,2026-05-19T21:01:35Z
+marts_team_career_stats_exists,pass,14,>0 rows,Required marts table check.,run_20260519_205906,2026-05-19T21:01:35Z
+marts_team_defense_season_stats_exists,pass,48,>0 rows,Required marts table check.,run_20260519_205906,2026-05-19T21:01:35Z
+marts_team_defense_career_stats_exists,pass,14,>0 rows,Required marts table check.,run_20260519_205906,2026-05-19T21:01:35Z
+marts_player_ranking_profiles_exists,pass,2079,>0 rows,Required marts table check.,run_20260519_205906,2026-05-19T21:01:35Z
+marts_team_style_profiles_exists,pass,62,>0 rows,Required marts table check.,run_20260519_205906,2026-05-19T21:01:35Z
+duplicate_clean_player_game_keys,pass,0,0,Duplicate clean player-game keys.,run_20260519_205906,2026-05-19T21:01:35Z
+duplicate_clean_team_game_keys,pass,0,0,Duplicate clean team-game keys.,run_20260519_205906,2026-05-19T21:01:35Z
+duplicate_player_ranking_context_keys,pass,0,0,Duplicate ranking rows by context/player.,run_20260519_205906,2026-05-19T21:01:35Z
+duplicate_team_style_context_keys,pass,0,0,Duplicate team style rows by context/team.,run_20260519_205906,2026-05-19T21:01:35Z

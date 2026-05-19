@@ -1,0 +1,6 @@
+season,url,status_code,cache_status,event_rows,payload_type,checked_at_utc
+2022,https://api.stats.premierlacrosseleague.com/api/v4/events?year=2022&seasonSegment=regular,200,downloaded,52,dict,2026-05-19T20:59:07Z
+2023,https://api.stats.premierlacrosseleague.com/api/v4/events?year=2023&seasonSegment=regular,200,downloaded,48,dict,2026-05-19T20:59:16Z
+2024,https://api.stats.premierlacrosseleague.com/api/v4/events?year=2024&seasonSegment=regular,200,downloaded,47,dict,2026-05-19T20:59:25Z
+2025,https://api.stats.premierlacrosseleague.com/api/v4/events?year=2025&seasonSegment=regular,200,downloaded,47,dict,2026-05-19T20:59:33Z
+2026,https://api.stats.premierlacrosseleague.com/api/v4/events?year=2026&seasonSegment=regular,200,downloaded,54,dict,2026-05-19T20:59:41Z

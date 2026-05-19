@@ -1,0 +1,15 @@
+team_id,games,team_name,caused_turnovers,saves,scores,split_type,caused_turnovers_for_per_game
+ARC,49,Archers,328,672,593,career,6.6938775510204085
+ATL,48,Atlas,315,634,632,career,6.5625
+CAN,46,Cannons,365,594,570,career,7.934782608695652
+CHA,50,Chaos,288,711,524,career,5.76
+OUT,47,Outlaws,303,553,512,career,6.446808510638298
+RED,48,Redwoods,338,563,534,career,7.041666666666667
+WAT,51,Waterdogs,392,638,636,career,7.686274509803922
+WHP,49,Whipsnakes,298,616,600,career,6.081632653061225
+ASA,1,,4,17,13,career,4.0
+ASE,2,,16,39,28,career,8.0
+ASH,1,,9,17,33,career,9.0
+ASW,2,,15,35,27,career,7.5
+RIS,1,,2,17,19,career,2.0
+VET,1,,14,24,26,career,14.0
