@@ -3812,7 +3812,7 @@ def robust_percentile(series: pd.Series, higher_is_better: bool = True) -> pd.Se
 
 def minmax_score(series: pd.Series, higher_is_better: bool = True) -> pd.Series:
     """
-    Min-max score on 0-100 scale. Safer than raw percentile for composite scoring.
+    Min-max score on 0-100 scale.
     """
 
     s = pd.to_numeric(series, errors="coerce")
@@ -3861,7 +3861,6 @@ def robust_z_score(series: pd.Series) -> pd.Series:
 def z_to_score(z: pd.Series) -> pd.Series:
     """
     Converts z-score style separation to 0-100 score.
-    50 = average peer separation.
     """
 
     z = pd.to_numeric(z, errors="coerce")
@@ -3942,29 +3941,64 @@ def build_game_possession_quality(team_game_stats: pd.DataFrame) -> pd.DataFrame
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    group_cols = [c for c in ["season", "game_id", "game_slug", "game_number", "game_date_utc"] if c in df.columns]
+    group_cols = [
+        c for c in [
+            "season",
+            "game_id",
+            "game_slug",
+            "game_number",
+            "game_date_utc",
+        ]
+        if c in df.columns
+    ]
 
     if not group_cols:
         return pd.DataFrame()
 
+    agg_dict = {
+        "team_rows": ("team_id", "count"),
+    }
+
+    if "time_in_possession" in df.columns:
+        agg_dict["combined_time_in_possession"] = ("time_in_possession", "sum")
+    else:
+        df["time_in_possession"] = np.nan
+        agg_dict["combined_time_in_possession"] = ("time_in_possession", "sum")
+
+    if "time_in_possession_pct" in df.columns:
+        agg_dict["combined_time_in_possession_pct"] = ("time_in_possession_pct", "sum")
+    else:
+        df["time_in_possession_pct"] = np.nan
+        agg_dict["combined_time_in_possession_pct"] = ("time_in_possession_pct", "sum")
+
+    if "touches" in df.columns:
+        agg_dict["combined_touches"] = ("touches", "sum")
+    else:
+        df["touches"] = np.nan
+        agg_dict["combined_touches"] = ("touches", "sum")
+
+    if "total_passes" in df.columns:
+        agg_dict["combined_passes"] = ("total_passes", "sum")
+    else:
+        df["total_passes"] = np.nan
+        agg_dict["combined_passes"] = ("total_passes", "sum")
+
+    if "offensive_sequence_proxy" in df.columns:
+        agg_dict["combined_offensive_sequence_proxy"] = ("offensive_sequence_proxy", "sum")
+    else:
+        df["offensive_sequence_proxy"] = np.nan
+        agg_dict["combined_offensive_sequence_proxy"] = ("offensive_sequence_proxy", "sum")
+
     agg = (
         df.groupby(group_cols, dropna=False)
-        .agg(
-            team_rows=("team_id", "count"),
-            combined_time_in_possession=("time_in_possession", "sum") if "time_in_possession" in df.columns else ("team_id", "size"),
-            combined_time_in_possession_pct=("time_in_possession_pct", "sum") if "time_in_possession_pct" in df.columns else ("team_id", "size"),
-            combined_touches=("touches", "sum") if "touches" in df.columns else ("team_id", "size"),
-            combined_passes=("total_passes", "sum") if "total_passes" in df.columns else ("team_id", "size"),
-            combined_offensive_sequence_proxy=("offensive_sequence_proxy", "sum") if "offensive_sequence_proxy" in df.columns else ("team_id", "size"),
-        )
+        .agg(**agg_dict)
         .reset_index()
     )
 
-    # Standard PLL game clock is 48:00 = 2880 seconds. OT/clock issues can exceed this.
     agg["standard_clock_seconds"] = 2880
-    agg["dead_ball_or_untracked_seconds"] = agg["standard_clock_seconds"] - pd.to_numeric(
-        agg["combined_time_in_possession"],
-        errors="coerce",
+    agg["dead_ball_or_untracked_seconds"] = (
+        agg["standard_clock_seconds"]
+        - pd.to_numeric(agg["combined_time_in_possession"], errors="coerce")
     )
 
     agg["combined_time_mmss"] = agg["combined_time_in_possession"].apply(seconds_to_mmss)
@@ -3972,25 +4006,11 @@ def build_game_possession_quality(team_game_stats: pd.DataFrame) -> pd.DataFrame
 
     agg["possession_data_status"] = "normal"
 
-    agg.loc[
-        pd.to_numeric(agg["combined_time_in_possession"], errors="coerce").fillna(0).eq(0),
-        "possession_data_status",
-    ] = "missing_possession_time"
+    combined_time = pd.to_numeric(agg["combined_time_in_possession"], errors="coerce").fillna(0)
 
-    agg.loc[
-        pd.to_numeric(agg["combined_time_in_possession"], errors="coerce") > 2880,
-        "possession_data_status",
-    ] = "extended_or_ot_clock"
-
-    agg.loc[
-        (
-            pd.to_numeric(agg["combined_time_in_possession"], errors="coerce") < 2400
-        )
-        & (
-            pd.to_numeric(agg["combined_time_in_possession"], errors="coerce") > 0
-        ),
-        "possession_data_status",
-    ] = "short_or_provider_clock"
+    agg.loc[combined_time.eq(0), "possession_data_status"] = "missing_possession_time"
+    agg.loc[combined_time.gt(2880), "possession_data_status"] = "extended_or_ot_clock"
+    agg.loc[(combined_time.lt(2400)) & (combined_time.gt(0)), "possession_data_status"] = "short_or_provider_clock"
 
     return agg.sort_values(["season", "game_number"], na_position="last").reset_index(drop=True)
 
@@ -4018,6 +4038,7 @@ def build_possession_field_quality(team_game_stats: pd.DataFrame) -> pd.DataFram
                 "exists": False,
                 "non_null_rows": 0,
                 "zero_rows": 0,
+                "total_rows": len(team_game_stats),
                 "coverage_rate": 0,
                 "notes": "field_missing",
             })
@@ -4085,7 +4106,10 @@ def build_team_game_opponent_context(team_game_stats: pd.DataFrame) -> pd.DataFr
     out = df[context_cols].copy()
 
     if "scores" in out.columns and "scores_against" in out.columns:
-        out["score_margin"] = pd.to_numeric(out["scores"], errors="coerce") - pd.to_numeric(out["scores_against"], errors="coerce")
+        out["score_margin"] = (
+            pd.to_numeric(out["scores"], errors="coerce")
+            - pd.to_numeric(out["scores_against"], errors="coerce")
+        )
 
     if "shots_against" in out.columns and "goals_against" in out.columns:
         out["opponent_goal_pct"] = safe_divide(out["goals_against"], out["shots_against"])
@@ -4177,7 +4201,10 @@ def build_team_defense_stats(
         out["caused_turnovers_for_per_game"] = pd.to_numeric(out["caused_turnovers"], errors="coerce") / games
 
     if "scores" in out.columns and "scores_against" in out.columns:
-        out["score_margin"] = pd.to_numeric(out["scores"], errors="coerce") - pd.to_numeric(out["scores_against"], errors="coerce")
+        out["score_margin"] = (
+            pd.to_numeric(out["scores"], errors="coerce")
+            - pd.to_numeric(out["scores_against"], errors="coerce")
+        )
         out["score_margin_per_game"] = out["score_margin"] / games
 
     if "goals_against" in out.columns and "shots_against" in out.columns:
@@ -4284,7 +4311,6 @@ def ranking_context_min_games(context_type: str, context_label: str, max_games: 
     if context_type == "Career":
         return 5 if max_games >= 5 else 1
 
-    # Dynamic early-season eligibility.
     if max_games <= 2:
         return 1
 
@@ -4300,7 +4326,6 @@ def add_player_scores_for_context(df: pd.DataFrame) -> pd.DataFrame:
 
     out = df.copy()
 
-    # Ensure all key columns exist.
     for c in [
         "points_per_game",
         "scoring_points_per_game",
@@ -4341,7 +4366,6 @@ def add_player_scores_for_context(df: pd.DataFrame) -> pd.DataFrame:
         default="Offense",
     )
 
-    # Core component scores.
     out["goal_value_score"] = (
         0.40 * minmax_score(out["scoring_points_per_game"], True).fillna(50)
         + 0.20 * minmax_score(out["one_point_goals_per_game"], True).fillna(50)
@@ -4397,7 +4421,6 @@ def add_player_scores_for_context(df: pd.DataFrame) -> pd.DataFrame:
         default=out["offensive_score"],
     )
 
-    # Role percentile and separation inside context/role.
     out["role_primary_percentile"] = np.nan
     out["role_robust_z"] = np.nan
     out["role_adjusted_z"] = np.nan
@@ -4424,7 +4447,6 @@ def add_player_scores_for_context(df: pd.DataFrame) -> pd.DataFrame:
         + 0.25 * pd.to_numeric(out["role_separation_score"], errors="coerce").fillna(50)
     ).clip(0, 100)
 
-    # Base impact keeps offensive production meaningful but avoids having only scorers dominate.
     out["base_impact_score"] = (
         0.42 * out["offensive_score"].fillna(50)
         + 0.18 * out["usage_score"].fillna(50)
@@ -4433,7 +4455,6 @@ def add_player_scores_for_context(df: pd.DataFrame) -> pd.DataFrame:
         + 0.12 * out["goalie_score"].fillna(50)
     ).clip(0, 100)
 
-    # Official ranking score. Internal names preserve app compatibility.
     out["v22_overall_score"] = np.select(
         [
             out["role_group"].eq("Offense"),
@@ -4452,7 +4473,6 @@ def add_player_scores_for_context(df: pd.DataFrame) -> pd.DataFrame:
 
     out["v22_overall_score"] = pd.to_numeric(out["v22_overall_score"], errors="coerce").clip(0, 100)
 
-    # Friendly duplicate names for app/table compatibility.
     out["overall_score"] = out["v22_overall_score"]
     out["overall_impact_score"] = out["v22_overall_score"]
     out["usage_possession_score"] = out["usage_score"]
@@ -4551,13 +4571,15 @@ def build_player_ranking_context(
                 .rank(method="min", ascending=False)
             )
 
-    # Friendly aliases expected by parts of the app.
     scored["overall_rank"] = scored["v22_overall_rank"]
     scored["overall_percentile"] = scored.get("v22_overall_percentile", np.nan)
     scored["position_rank"] = scored["v22_position_rank"]
     scored["position_percentile"] = scored.get("v22_position_percentile", np.nan)
 
-    return scored.sort_values(["ranking_context_type", "ranking_context", "v22_overall_rank"], na_position="last").reset_index(drop=True)
+    return scored.sort_values(
+        ["ranking_context_type", "ranking_context", "v22_overall_rank"],
+        na_position="last",
+    ).reset_index(drop=True)
 
 
 def build_player_ranking_profiles(marts: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -4586,7 +4608,6 @@ def build_player_ranking_profiles(marts: dict[str, pd.DataFrame]) -> pd.DataFram
 
     out = pd.concat(contexts, ignore_index=True, sort=False)
 
-    # Round score columns.
     score_cols = [c for c in out.columns if c.endswith("_score") or c.endswith("_percentile") or c.endswith("_rank")]
     for c in score_cols:
         out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
@@ -4635,7 +4656,6 @@ def build_team_style_context(
         return pd.DataFrame()
 
     teams = team_stats.copy()
-
     defense = team_defense_stats.copy() if team_defense_stats is not None else pd.DataFrame()
 
     if len(defense) > 0:
@@ -4663,16 +4683,59 @@ def build_team_style_context(
             if c in defense.columns
         ]
 
-        defense_small = defense[keep_cols].drop_duplicates(merge_keys)
+        if all(k in defense.columns for k in merge_keys):
+            defense_small = defense[keep_cols].drop_duplicates(merge_keys)
 
-        teams = teams.merge(
-            defense_small,
-            on=merge_keys,
-            how="left",
-            suffixes=("", "_def"),
-        )
+            teams = teams.merge(
+                defense_small,
+                on=merge_keys,
+                how="left",
+                suffixes=("", "_def"),
+            )
 
-    for c in [
+    alias_pairs = {
+        "scores_allowed_per_game": ["scores_allowed_per_game_def", "scores_against_per_game"],
+        "goals_allowed_per_game": ["goals_allowed_per_game_def", "goals_against_per_game"],
+        "opponent_shots_per_game": ["opponent_shots_per_game_def", "def_opponent_shots_per_game", "shots_against_per_game"],
+        "opponent_goal_pct": ["opponent_goal_pct_def", "def_opponent_goal_pct"],
+        "opponent_sog_rate": ["opponent_sog_rate_def"],
+        "save_pct_proxy": ["save_pct_proxy_def", "def_save_pct_proxy"],
+    }
+
+    for primary_col, fallback_cols in alias_pairs.items():
+        if primary_col not in teams.columns:
+            teams[primary_col] = np.nan
+
+        for fallback_col in fallback_cols:
+            if fallback_col in teams.columns:
+                teams[primary_col] = teams[primary_col].fillna(teams[fallback_col])
+
+    if "opponent_goal_pct" not in teams.columns:
+        teams["opponent_goal_pct"] = np.nan
+
+    if teams["opponent_goal_pct"].isna().all():
+        if "goals_against" in teams.columns and "shots_against" in teams.columns:
+            teams["opponent_goal_pct"] = safe_divide(
+                teams["goals_against"],
+                teams["shots_against"],
+            )
+        elif "goals_against" in teams.columns and "shots_against_per_game" in teams.columns and "games" in teams.columns:
+            teams["opponent_goal_pct"] = safe_divide(
+                teams["goals_against"],
+                pd.to_numeric(teams["shots_against_per_game"], errors="coerce")
+                * pd.to_numeric(teams["games"], errors="coerce"),
+            )
+
+    if "save_pct_proxy" not in teams.columns:
+        teams["save_pct_proxy"] = np.nan
+
+    if teams["save_pct_proxy"].isna().all():
+        if "saves" in teams.columns and "goals_against" in teams.columns:
+            saves = pd.to_numeric(teams["saves"], errors="coerce")
+            ga = pd.to_numeric(teams["goals_against"], errors="coerce")
+            teams["save_pct_proxy"] = (saves / (saves + ga).replace(0, np.nan)).clip(0, 1)
+
+    required_numeric_cols = [
         "scores_per_game",
         "shots_per_game",
         "touches_per_game",
@@ -4684,13 +4747,21 @@ def build_team_style_context(
         "scores_allowed_per_game",
         "goals_allowed_per_game",
         "opponent_shots_per_game",
+        "opponent_goal_pct",
+        "opponent_sog_rate",
         "save_pct_proxy",
         "faceoff_pct_calc",
         "clear_pct_calc",
         "score_margin_per_game",
-    ]:
+        "shot_pct_calc",
+        "total_passes_per_game",
+    ]
+
+    for c in required_numeric_cols:
         if c not in teams.columns:
             teams[c] = np.nan
+
+        teams[c] = pd.to_numeric(teams[c], errors="coerce")
 
     teams["profile_context_type"] = context_type
     teams["profile_context"] = context_label
@@ -4704,21 +4775,21 @@ def build_team_style_context(
 
     teams["offensive_efficiency_score"] = (
         0.45 * minmax_score(teams["scores_per_game"], True).fillna(50)
-        + 0.25 * minmax_score(teams.get("shot_pct_calc", pd.Series(np.nan, index=teams.index)), True).fillna(50)
+        + 0.25 * minmax_score(teams["shot_pct_calc"], True).fillna(50)
         + 0.20 * minmax_score(teams["turnovers_per_game"], False).fillna(50)
         + 0.10 * minmax_score(teams["score_margin_per_game"], True).fillna(50)
     ).clip(0, 100)
 
     teams["ball_movement_score"] = (
         0.55 * minmax_score(teams["assists_per_game"], True).fillna(50)
-        + 0.25 * minmax_score(teams.get("total_passes_per_game", pd.Series(np.nan, index=teams.index)), True).fillna(50)
+        + 0.25 * minmax_score(teams["total_passes_per_game"], True).fillna(50)
         + 0.20 * minmax_score(teams["touches_per_game"], True).fillna(50)
     ).clip(0, 100)
 
     teams["possession_control_score"] = (
         0.45 * minmax_score(teams["touches_per_game"], True).fillna(50)
         + 0.35 * minmax_score(teams["time_in_possession_per_game"], True).fillna(50)
-        + 0.20 * minmax_score(teams.get("faceoff_pct_calc", pd.Series(np.nan, index=teams.index)), True).fillna(50)
+        + 0.20 * minmax_score(teams["faceoff_pct_calc"], True).fillna(50)
     ).clip(0, 100)
 
     teams["defensive_suppression_score"] = (
@@ -4749,24 +4820,18 @@ def build_team_style_context(
 
     teams["profile_rank"] = teams["team_style_overall_score"].rank(method="min", ascending=False)
 
-    if "scores_allowed_per_game" in teams.columns:
-        teams["def_scores_allowed_per_game"] = teams["scores_allowed_per_game"]
+    teams["def_scores_allowed_per_game"] = teams["scores_allowed_per_game"]
+    teams["def_opponent_shots_per_game"] = teams["opponent_shots_per_game"]
+    teams["def_opponent_goal_pct"] = teams["opponent_goal_pct"]
+    teams["def_save_pct_proxy"] = teams["save_pct_proxy"]
 
-    if "opponent_shots_per_game" in teams.columns:
-        teams["def_opponent_shots_per_game"] = teams["opponent_shots_per_game"]
+    teams["net_scores_per_game"] = (
+        pd.to_numeric(teams["scores_per_game"], errors="coerce")
+        - pd.to_numeric(teams["scores_allowed_per_game"], errors="coerce")
+    )
 
-    if "save_pct_proxy" in teams.columns:
-        teams["def_save_pct_proxy"] = teams["save_pct_proxy"]
-
-    if "scores_per_game" in teams.columns and "scores_allowed_per_game" in teams.columns:
-        teams["net_scores_per_game"] = (
-            pd.to_numeric(teams["scores_per_game"], errors="coerce")
-            - pd.to_numeric(teams["scores_allowed_per_game"], errors="coerce")
-        )
-
-    if "time_in_possession_per_game" in teams.columns:
-        teams["time_in_possession_per_game_mmss"] = teams["time_in_possession_per_game"].apply(seconds_to_mmss)
-        teams["possession_pg"] = teams["time_in_possession_per_game_mmss"]
+    teams["time_in_possession_per_game_mmss"] = teams["time_in_possession_per_game"].apply(seconds_to_mmss)
+    teams["possession_pg"] = teams["time_in_possession_per_game_mmss"]
 
     teams["pace_label"] = teams["pace_tempo_score"].apply(
         lambda x: label_from_score(
@@ -4828,7 +4893,10 @@ def build_team_style_context(
         if c in teams.columns:
             teams[c] = pd.to_numeric(teams[c], errors="coerce").round(2)
 
-    return teams.sort_values(["profile_context_type", "profile_context", "profile_rank"], na_position="last").reset_index(drop=True)
+    return teams.sort_values(
+        ["profile_context_type", "profile_context", "profile_rank"],
+        na_position="last",
+    ).reset_index(drop=True)
 
 
 def build_team_style_profiles(
@@ -4897,15 +4965,12 @@ def write_all_artifacts_and_duckdb(
 ) -> pd.DataFrame:
     artifact_rows: list[dict[str, Any]] = []
 
-    # Write clean tables.
     for name, df in clean_tables.items():
         write_table_artifacts(name, df, artifact_rows)
 
-    # Write marts.
     for name, df in marts.items():
         write_table_artifacts(name, df, artifact_rows)
 
-    # Write QC tables.
     for name, df in qc_tables.items():
         write_table_artifacts(name, df, artifact_rows)
 
@@ -4913,26 +4978,21 @@ def write_all_artifacts_and_duckdb(
     table_index_path = CURATED_ALL_DIR / "duckdb_table_index.csv"
     table_index.to_csv(table_index_path, index=False)
 
-    # Recreate DuckDB.
     if DB_PATH.exists():
         DB_PATH.unlink()
 
     con = duckdb.connect(str(DB_PATH))
 
     try:
-        # Clean schema.
         for table_name in clean_tables.keys():
             duckdb_load_parquet(con, "clean", table_name)
 
-        # Marts schema.
         for table_name in marts.keys():
             duckdb_load_parquet(con, "marts", table_name)
 
-        # QC schema.
         for table_name in qc_tables.keys():
             duckdb_load_parquet(con, "qc", table_name)
 
-        # Convenience table index.
         con.execute("CREATE SCHEMA IF NOT EXISTS qc;")
         con.execute(
             f"""
@@ -4942,29 +5002,23 @@ def write_all_artifacts_and_duckdb(
             """
         )
 
-        # Basic sanity view.
         con.execute("""
             CREATE OR REPLACE VIEW qc.table_counts AS
-            SELECT 'clean' AS schema_name, table_name, row_count
-            FROM (
-                SELECT table_name, estimated_size AS row_count
-                FROM duckdb_tables()
-                WHERE schema_name = 'clean'
-            )
+            SELECT 'clean' AS schema_name, table_name, estimated_size AS row_count
+            FROM duckdb_tables()
+            WHERE schema_name = 'clean'
+
             UNION ALL
-            SELECT 'marts' AS schema_name, table_name, row_count
-            FROM (
-                SELECT table_name, estimated_size AS row_count
-                FROM duckdb_tables()
-                WHERE schema_name = 'marts'
-            )
+
+            SELECT 'marts' AS schema_name, table_name, estimated_size AS row_count
+            FROM duckdb_tables()
+            WHERE schema_name = 'marts'
+
             UNION ALL
-            SELECT 'qc' AS schema_name, table_name, row_count
-            FROM (
-                SELECT table_name, estimated_size AS row_count
-                FROM duckdb_tables()
-                WHERE schema_name = 'qc'
-            );
+
+            SELECT 'qc' AS schema_name, table_name, estimated_size AS row_count
+            FROM duckdb_tables()
+            WHERE schema_name = 'qc';
         """)
 
     finally:
@@ -4992,7 +5046,6 @@ def build_final_qc_tables(
     marts: dict[str, pd.DataFrame],
     defense_marts: dict[str, pd.DataFrame],
 ) -> dict[str, pd.DataFrame]:
-    # Add high-level expected table checks.
     required_clean = [
         "game_manifest",
         "game_schedule_all",
@@ -5036,7 +5089,6 @@ def build_final_qc_tables(
             "Required marts table check.",
         )
 
-    # Duplicate keys.
     player_game = clean_tables.get("player_game_stats", pd.DataFrame())
     if len(player_game) > 0:
         dup_cols = [c for c in ["season", "game_id", "player_id", "team_id"] if c in player_game.columns]
@@ -5120,7 +5172,6 @@ def build_final_qc_tables(
         "game_possession_quality": defense_marts.get("game_possession_quality", pd.DataFrame()),
         "possession_field_quality": defense_marts.get("possession_field_quality", pd.DataFrame()),
         "defensive_opponent_build_quality": defense_marts.get("defensive_opponent_build_quality", pd.DataFrame()),
-        # Placeholders for app compatibility if older app tabs expect these.
         "stat_slug_inventory": pd.DataFrame(),
     }
 
@@ -5150,7 +5201,6 @@ def main() -> None:
     print("\nSTEP 4 — Building defensive/opponent and possession marts...")
     defense_marts = build_defensive_opponent_marts(clean_tables.get("team_game_stats", pd.DataFrame()))
 
-    # Add defensive marts to marts dict.
     for key in [
         "team_game_opponent_context",
         "team_game_possession_quality",
