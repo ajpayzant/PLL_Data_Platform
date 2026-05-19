@@ -2979,3 +2979,2234 @@ def collect_game_stats(game_schedule_all: pd.DataFrame) -> dict[str, pd.DataFram
 # ============================================================
 # SECTION 2C COMPLETE
 # ============================================================
+
+# ============================================================
+# SECTION 2D — CLEAN TABLES AND CORE MARTS
+# ============================================================
+
+def make_player_key(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensures player_id exists and is stable enough for grouping.
+    Uses source player_id first, then normalized name fallback.
+    """
+
+    if df is None or len(df) == 0:
+        return df
+
+    out = df.copy()
+
+    if "normalized_name" not in out.columns and "full_name" in out.columns:
+        out["normalized_name"] = out["full_name"].apply(normalize_person_name)
+
+    if "player_id" not in out.columns:
+        out["player_id"] = pd.NA
+
+    out["player_id"] = out["player_id"].astype("string")
+
+    fallback = (
+        "name_"
+        + out.get("normalized_name", pd.Series(pd.NA, index=out.index))
+        .astype("string")
+        .fillna("")
+        .str.replace(" ", "_", regex=False)
+    )
+
+    fallback = fallback.mask(fallback.eq("name_"), pd.NA)
+
+    out["player_id"] = out["player_id"].mask(
+        out["player_id"].isna()
+        | out["player_id"].astype(str).str.strip().eq("")
+        | out["player_id"].astype(str).str.lower().isin(["nan", "none", "<na>"]),
+        fallback,
+    )
+
+    return out
+
+
+def normalize_clean_player_game_stats(player_game_stats: pd.DataFrame) -> pd.DataFrame:
+    if player_game_stats is None or len(player_game_stats) == 0:
+        return pd.DataFrame()
+
+    out = player_game_stats.copy()
+
+    out = make_player_key(out)
+
+    for col in ["season", "game_number"]:
+        if col in out.columns:
+            out[col] = safe_nullable_int(out[col])
+
+    for col in ["team_id", "opponent_team_id"]:
+        if col in out.columns:
+            out[col] = out[col].apply(canonical_team_id)
+
+    if "team_name" in out.columns and "team_id_raw" in out.columns:
+        out["team_name"] = out.apply(
+            lambda r: canonical_team_name(r.get("team_id_raw"), r.get("team_name")),
+            axis=1,
+        )
+
+    if "full_name" in out.columns:
+        out["full_name"] = out["full_name"].astype("string").str.strip()
+
+    if "position" in out.columns:
+        out["position"] = out["position"].astype("string").str.strip()
+
+    out = add_standard_player_rates(out)
+
+    # Enforce reasonable goalie save percentage.
+    if "saves" in out.columns:
+        saves = pd.to_numeric(out["saves"], errors="coerce")
+
+        if "goals_against" in out.columns:
+            ga = pd.to_numeric(out["goals_against"], errors="coerce")
+        elif "scores_against" in out.columns:
+            ga = pd.to_numeric(out["scores_against"], errors="coerce")
+        else:
+            ga = pd.Series(np.nan, index=out.index)
+
+        out["save_pct_calc"] = (saves / (saves + ga).replace(0, np.nan)).clip(0, 1)
+
+    sort_cols = [c for c in ["season", "game_number", "game_id", "team_id", "full_name"] if c in out.columns]
+    if sort_cols:
+        out = out.sort_values(sort_cols).reset_index(drop=True)
+
+    return out
+
+
+def normalize_clean_team_game_stats(team_game_stats: pd.DataFrame) -> pd.DataFrame:
+    if team_game_stats is None or len(team_game_stats) == 0:
+        return pd.DataFrame()
+
+    out = team_game_stats.copy()
+
+    for col in ["season", "game_number"]:
+        if col in out.columns:
+            out[col] = safe_nullable_int(out[col])
+
+    for col in ["team_id", "opponent_team_id"]:
+        if col in out.columns:
+            out[col] = out[col].apply(canonical_team_id)
+
+    if "team_name" in out.columns and "team_id_raw" in out.columns:
+        out["team_name"] = out.apply(
+            lambda r: canonical_team_name(r.get("team_id_raw"), r.get("team_name")),
+            axis=1,
+        )
+
+    out = fill_team_opponent_stats_from_pair(out)
+    out = add_standard_team_rates(out)
+
+    if "scores" in out.columns and "scores_against" in out.columns:
+        scores = pd.to_numeric(out["scores"], errors="coerce")
+        allowed = pd.to_numeric(out["scores_against"], errors="coerce")
+
+        out["score_based_win"] = (scores > allowed).astype("Int64")
+        out["score_based_loss"] = (scores < allowed).astype("Int64")
+        out["score_margin"] = scores - allowed
+
+    sort_cols = [c for c in ["season", "game_number", "game_id", "team_id"] if c in out.columns]
+    if sort_cols:
+        out = out.sort_values(sort_cols).reset_index(drop=True)
+
+    return out
+
+
+def build_team_directory(
+    game_schedule_all: pd.DataFrame,
+    team_game_stats: pd.DataFrame,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+
+    for team_id, team_name in TEAM_NAME_CANONICAL_MAP.items():
+        if team_id == "CHR":
+            continue
+
+        rows.append({
+            "team_id": team_id,
+            "team_name": team_name,
+            "team_display_name": TEAM_DISPLAY_NAME_LOOKUP.get(team_id, team_name),
+            "is_current_team": 1,
+        })
+
+    if game_schedule_all is not None and len(game_schedule_all) > 0:
+        for side in ["home", "away"]:
+            id_col = f"{side}_team_id"
+            name_col = f"{side}_team_name"
+
+            if id_col in game_schedule_all.columns:
+                temp = game_schedule_all[[id_col, name_col]].copy() if name_col in game_schedule_all.columns else game_schedule_all[[id_col]].copy()
+                temp = temp.rename(columns={id_col: "team_id", name_col: "team_name"})
+                temp["team_id"] = temp["team_id"].apply(canonical_team_id)
+                temp["team_name"] = temp.apply(
+                    lambda r: canonical_team_name(r.get("team_id"), r.get("team_name")),
+                    axis=1,
+                )
+
+                for _, r in temp.dropna(subset=["team_id"]).drop_duplicates("team_id").iterrows():
+                    rows.append({
+                        "team_id": r["team_id"],
+                        "team_name": r["team_name"],
+                        "team_display_name": TEAM_DISPLAY_NAME_LOOKUP.get(str(r["team_id"]), r["team_name"]),
+                        "is_current_team": 1,
+                    })
+
+    if team_game_stats is not None and len(team_game_stats) > 0:
+        temp = team_game_stats[[c for c in ["team_id", "team_name"] if c in team_game_stats.columns]].copy()
+
+        if len(temp.columns) >= 1:
+            temp["team_id"] = temp["team_id"].apply(canonical_team_id)
+
+            if "team_name" not in temp.columns:
+                temp["team_name"] = temp["team_id"].map(TEAM_NAME_CANONICAL_MAP)
+
+            for _, r in temp.dropna(subset=["team_id"]).drop_duplicates("team_id").iterrows():
+                rows.append({
+                    "team_id": r["team_id"],
+                    "team_name": canonical_team_name(r["team_id"], r.get("team_name")),
+                    "team_display_name": TEAM_DISPLAY_NAME_LOOKUP.get(str(r["team_id"]), canonical_team_name(r["team_id"], r.get("team_name"))),
+                    "is_current_team": 1,
+                })
+
+    out = pd.DataFrame(rows)
+
+    if len(out) == 0:
+        return out
+
+    out = (
+        out.drop_duplicates("team_id", keep="first")
+        .sort_values("team_name")
+        .reset_index(drop=True)
+    )
+
+    return out
+
+
+def build_player_directory(player_game_stats: pd.DataFrame) -> pd.DataFrame:
+    if player_game_stats is None or len(player_game_stats) == 0:
+        return pd.DataFrame()
+
+    g = player_game_stats.copy()
+    g = make_player_key(g)
+
+    sort_cols = [c for c in ["season", "game_number", "game_id"] if c in g.columns]
+    if sort_cols:
+        g = g.sort_values(sort_cols)
+
+    rows = []
+
+    for player_id, grp in g.groupby("player_id", dropna=False):
+        rows.append({
+            "player_id": player_id,
+            "full_name": latest_non_null_by_game(grp, "full_name"),
+            "first_name": latest_non_null_by_game(grp, "first_name"),
+            "last_name": latest_non_null_by_game(grp, "last_name"),
+            "normalized_name": latest_non_null_by_game(grp, "normalized_name"),
+            "position": latest_non_null_by_game(grp, "position"),
+            "position_name": latest_non_null_by_game(grp, "position_name"),
+            "latest_team_id": latest_non_null_by_game(grp, "team_id"),
+            "latest_team_name": latest_non_null_by_game(grp, "team_name"),
+            "first_season": pd.to_numeric(grp["season"], errors="coerce").min() if "season" in grp.columns else pd.NA,
+            "last_season": pd.to_numeric(grp["season"], errors="coerce").max() if "season" in grp.columns else pd.NA,
+            "games_in_database": grp["game_id"].nunique() if "game_id" in grp.columns else len(grp),
+        })
+
+    out = pd.DataFrame(rows)
+
+    if len(out) > 0:
+        out["first_season"] = safe_nullable_int(out["first_season"])
+        out["last_season"] = safe_nullable_int(out["last_season"])
+        out = out.sort_values(["full_name", "player_id"], na_position="last").reset_index(drop=True)
+
+    return out
+
+
+def build_game_manifest(
+    game_schedule_all: pd.DataFrame,
+    team_game_stats: pd.DataFrame,
+    player_game_stats: pd.DataFrame,
+) -> pd.DataFrame:
+    schedule = game_schedule_all.copy() if game_schedule_all is not None else pd.DataFrame()
+
+    if schedule is None or len(schedule) == 0:
+        return pd.DataFrame()
+
+    out = schedule.copy()
+
+    stat_game_counts = pd.DataFrame()
+
+    if team_game_stats is not None and len(team_game_stats) > 0:
+        team_counts = (
+            team_game_stats
+            .groupby(["season", "game_id"], dropna=False)
+            .agg(
+                team_rows=("team_id", "count"),
+                teams_in_team_game=("team_id", "nunique"),
+            )
+            .reset_index()
+        )
+    else:
+        team_counts = pd.DataFrame(columns=["season", "game_id", "team_rows", "teams_in_team_game"])
+
+    if player_game_stats is not None and len(player_game_stats) > 0:
+        player_counts = (
+            player_game_stats
+            .groupby(["season", "game_id"], dropna=False)
+            .agg(
+                player_rows=("player_id", "count"),
+                players_in_player_game=("player_id", "nunique"),
+                teams_in_player_game=("team_id", "nunique"),
+            )
+            .reset_index()
+        )
+    else:
+        player_counts = pd.DataFrame(columns=["season", "game_id", "player_rows", "players_in_player_game", "teams_in_player_game"])
+
+    out = out.merge(team_counts, on=["season", "game_id"], how="left")
+    out = out.merge(player_counts, on=["season", "game_id"], how="left")
+
+    if team_game_stats is not None and len(team_game_stats) > 0:
+        team_score = team_game_stats.copy()
+
+        if "scores" in team_score.columns and "scores_against" in team_score.columns:
+            team_score["score_based_win"] = (
+                pd.to_numeric(team_score["scores"], errors="coerce")
+                > pd.to_numeric(team_score["scores_against"], errors="coerce")
+            ).astype("Int64")
+
+            winners = team_score[team_score["score_based_win"] == 1].copy()
+
+            winners = winners[[
+                c for c in [
+                    "season",
+                    "game_id",
+                    "team_id",
+                    "team_name",
+                    "scores",
+                    "scores_against",
+                ]
+                if c in winners.columns
+            ]].rename(columns={
+                "team_id": "score_based_winner_team_id",
+                "team_name": "score_based_winner_team_name",
+                "scores": "winner_score",
+                "scores_against": "loser_score",
+            })
+
+            winners = winners.drop_duplicates(["season", "game_id"], keep="first")
+
+            out = out.merge(winners, on=["season", "game_id"], how="left")
+
+    for col in [
+        "team_rows",
+        "teams_in_team_game",
+        "player_rows",
+        "players_in_player_game",
+        "teams_in_player_game",
+    ]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype("Int64")
+
+    out["has_team_stats"] = out.get("team_rows", pd.Series(0, index=out.index)).fillna(0).astype(int) > 0
+    out["has_player_stats"] = out.get("player_rows", pd.Series(0, index=out.index)).fillna(0).astype(int) > 0
+    out["is_complete_game_record"] = out["has_team_stats"] & out["has_player_stats"]
+
+    if "game_date_utc" in out.columns:
+        out["game_date_utc"] = out["game_date_utc"].astype("string")
+
+    out = out.sort_values(["season", "game_number", "game_date_utc"], na_position="last").reset_index(drop=True)
+
+    return out
+
+
+# ============================================================
+# PLAYER MART BUILDERS
+# ============================================================
+
+PLAYER_TOTAL_COLS = [
+    "points",
+    "scoring_points",
+    "one_point_goals",
+    "two_point_goals",
+    "goals",
+    "assists",
+    "shots",
+    "shots_on_goal",
+    "two_point_shots",
+    "ground_balls",
+    "turnovers",
+    "caused_turnovers",
+    "faceoffs_won",
+    "faceoffs_lost",
+    "faceoffs",
+    "saves",
+    "clean_saves",
+    "messy_saves",
+    "scores_against",
+    "goals_against",
+    "penalties",
+    "penalty_time",
+    "touches",
+    "total_passes",
+]
+
+PLAYER_IDENTITY_COLS = [
+    "player_id",
+    "full_name",
+    "position",
+    "position_name",
+]
+
+
+def aggregate_player_stats(
+    df: pd.DataFrame,
+    group_cols: list[str],
+    split_type: str,
+) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+
+    data = df.copy()
+    data = make_player_key(data)
+
+    for c in PLAYER_TOTAL_COLS:
+        if c in data.columns:
+            data[c] = pd.to_numeric(data[c], errors="coerce").fillna(0)
+
+    agg_dict: dict[str, Any] = {}
+
+    if "game_id" in data.columns:
+        agg_dict["games"] = ("game_id", "nunique")
+    else:
+        agg_dict["games"] = ("player_id", "size")
+
+    for c in PLAYER_TOTAL_COLS:
+        if c in data.columns:
+            agg_dict[c] = (c, "sum")
+
+    if "team_id" in data.columns:
+        agg_dict["team_ids"] = ("team_id", lambda s: ", ".join(sorted(set(map(str, s.dropna())))))
+
+    if "team_name" in data.columns:
+        agg_dict["teams"] = ("team_name", lambda s: ", ".join(sorted(set(map(str, s.dropna())))))
+
+    for c in ["full_name", "position", "position_name"]:
+        if c in data.columns and c not in group_cols:
+            agg_dict[c] = (c, mode_or_first)
+
+    out = data.groupby(group_cols, dropna=False).agg(**agg_dict).reset_index()
+
+    out["split_type"] = split_type
+
+    out = add_standard_player_rates(out)
+
+    if "games" in out.columns:
+        out["games"] = pd.to_numeric(out["games"], errors="coerce").fillna(0).astype("Int64")
+
+    sort_cols = [c for c in ["season", "full_name", "team_name", "teams"] if c in out.columns]
+    if sort_cols:
+        out = out.sort_values(sort_cols, na_position="last").reset_index(drop=True)
+
+    return out
+
+
+def build_player_season_stats(player_game_stats: pd.DataFrame) -> pd.DataFrame:
+    group_cols = ["season", "player_id"]
+    return aggregate_player_stats(player_game_stats, group_cols, "season")
+
+
+def build_player_season_stats_by_team(player_game_stats: pd.DataFrame) -> pd.DataFrame:
+    group_cols = ["season", "team_id", "team_name", "player_id"]
+    return aggregate_player_stats(player_game_stats, group_cols, "season_by_team")
+
+
+def build_player_career_stats(player_game_stats: pd.DataFrame) -> pd.DataFrame:
+    group_cols = ["player_id"]
+    return aggregate_player_stats(player_game_stats, group_cols, "career")
+
+
+def build_player_vs_opponent_stats(player_game_stats: pd.DataFrame) -> pd.DataFrame:
+    group_cols = ["player_id", "opponent_team_id", "opponent_team_name"]
+    return aggregate_player_stats(player_game_stats, group_cols, "vs_opponent")
+
+
+def latest_n_games_by_group(
+    df: pd.DataFrame,
+    group_col: str,
+    n: int,
+    season_col: Optional[str] = None,
+) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+
+    out = df.copy()
+
+    sort_cols = [c for c in ["season", "game_number", "game_date_utc", "game_id"] if c in out.columns]
+
+    if sort_cols:
+        out = out.sort_values(sort_cols)
+
+    group_cols = [group_col]
+
+    if season_col and season_col in out.columns:
+        group_cols = [season_col, group_col]
+
+    return (
+        out.groupby(group_cols, dropna=False, group_keys=False)
+        .tail(n)
+        .reset_index(drop=True)
+    )
+
+
+def build_player_recent_stats(
+    player_game_stats: pd.DataFrame,
+    n: int,
+    by_season: bool = False,
+) -> pd.DataFrame:
+    if player_game_stats is None or len(player_game_stats) == 0:
+        return pd.DataFrame()
+
+    recent = latest_n_games_by_group(
+        player_game_stats,
+        group_col="player_id",
+        n=n,
+        season_col="season" if by_season else None,
+    )
+
+    group_cols = ["season", "player_id"] if by_season else ["player_id"]
+    split_type = f"season_last{n}" if by_season else f"last{n}"
+
+    return aggregate_player_stats(recent, group_cols, split_type)
+
+
+# ============================================================
+# TEAM MART BUILDERS
+# ============================================================
+
+TEAM_TOTAL_COLS = [
+    "scores",
+    "scoring_points",
+    "one_point_goals",
+    "two_point_goals",
+    "goals",
+    "assists",
+    "shots",
+    "shots_on_goal",
+    "two_point_shots",
+    "ground_balls",
+    "turnovers",
+    "caused_turnovers",
+    "saves",
+    "faceoffs_won",
+    "faceoffs_lost",
+    "faceoffs",
+    "total_clears",
+    "failed_clears",
+    "clear_attempts",
+    "touches",
+    "total_passes",
+    "time_in_possession",
+    "time_in_possession_pct",
+    "total_possessions",
+    "official_total_possessions",
+    "offensive_sequence_proxy",
+    "scores_against",
+    "scoring_points_against",
+    "one_point_goals_against",
+    "two_point_goals_against",
+    "goals_against",
+    "assists_against",
+    "shots_against",
+    "shots_on_goal_against",
+    "ground_balls_against",
+    "turnovers_against",
+    "caused_turnovers_against",
+    "saves_against",
+    "touches_against",
+    "total_passes_against",
+    "offensive_sequence_proxy_against",
+]
+
+
+def aggregate_team_stats(
+    df: pd.DataFrame,
+    group_cols: list[str],
+    split_type: str,
+) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+
+    data = df.copy()
+
+    for c in TEAM_TOTAL_COLS:
+        if c in data.columns:
+            data[c] = pd.to_numeric(data[c], errors="coerce").fillna(0)
+
+    agg_dict: dict[str, Any] = {}
+
+    if "game_id" in data.columns:
+        agg_dict["games"] = ("game_id", "nunique")
+    else:
+        agg_dict["games"] = ("team_id", "size")
+
+    if "score_based_win" in data.columns:
+        agg_dict["wins"] = ("score_based_win", "sum")
+
+    if "score_based_loss" in data.columns:
+        agg_dict["losses"] = ("score_based_loss", "sum")
+
+    for c in TEAM_TOTAL_COLS:
+        if c in data.columns:
+            agg_dict[c] = (c, "sum")
+
+    for c in ["team_name"]:
+        if c in data.columns and c not in group_cols:
+            agg_dict[c] = (c, mode_or_first)
+
+    out = data.groupby(group_cols, dropna=False).agg(**agg_dict).reset_index()
+
+    out["split_type"] = split_type
+
+    if "games" in out.columns:
+        out["games"] = pd.to_numeric(out["games"], errors="coerce").fillna(0).astype("Int64")
+
+    if "wins" in out.columns and "losses" in out.columns:
+        games = pd.to_numeric(out["games"], errors="coerce").replace(0, np.nan)
+        out["win_pct"] = pd.to_numeric(out["wins"], errors="coerce") / games
+
+    if "scores" in out.columns and "scores_against" in out.columns:
+        games = pd.to_numeric(out["games"], errors="coerce").replace(0, np.nan)
+        out["score_margin"] = pd.to_numeric(out["scores"], errors="coerce") - pd.to_numeric(out["scores_against"], errors="coerce")
+        out["score_margin_per_game"] = out["score_margin"] / games
+
+    out = add_standard_team_rates(out)
+
+    if "scores_against" in out.columns and "games" in out.columns:
+        games = pd.to_numeric(out["games"], errors="coerce").replace(0, np.nan)
+        out["scores_against_per_game"] = pd.to_numeric(out["scores_against"], errors="coerce") / games
+
+    if "goals_against" in out.columns and "games" in out.columns:
+        games = pd.to_numeric(out["games"], errors="coerce").replace(0, np.nan)
+        out["goals_against_per_game"] = pd.to_numeric(out["goals_against"], errors="coerce") / games
+
+    if "shots_against" in out.columns and "games" in out.columns:
+        games = pd.to_numeric(out["games"], errors="coerce").replace(0, np.nan)
+        out["opponent_shots_per_game"] = pd.to_numeric(out["shots_against"], errors="coerce") / games
+
+    if "shots_on_goal_against" in out.columns and "games" in out.columns:
+        games = pd.to_numeric(out["games"], errors="coerce").replace(0, np.nan)
+        out["opponent_shots_on_goal_per_game"] = pd.to_numeric(out["shots_on_goal_against"], errors="coerce") / games
+
+    if "saves" in out.columns and "goals_against" in out.columns:
+        saves = pd.to_numeric(out["saves"], errors="coerce")
+        ga = pd.to_numeric(out["goals_against"], errors="coerce")
+        out["save_pct_proxy"] = (saves / (saves + ga).replace(0, np.nan)).clip(0, 1)
+
+    sort_cols = [c for c in ["season", "team_name", "team_id"] if c in out.columns]
+    if sort_cols:
+        out = out.sort_values(sort_cols, na_position="last").reset_index(drop=True)
+
+    return out
+
+
+def build_team_season_stats(team_game_stats: pd.DataFrame) -> pd.DataFrame:
+    return aggregate_team_stats(team_game_stats, ["season", "team_id"], "season")
+
+
+def build_team_career_stats(team_game_stats: pd.DataFrame) -> pd.DataFrame:
+    return aggregate_team_stats(team_game_stats, ["team_id"], "career")
+
+
+def build_team_vs_opponent_stats(team_game_stats: pd.DataFrame) -> pd.DataFrame:
+    return aggregate_team_stats(
+        team_game_stats,
+        ["team_id", "opponent_team_id", "opponent_team_name"],
+        "vs_opponent",
+    )
+
+
+def build_team_recent_stats(
+    team_game_stats: pd.DataFrame,
+    n: int,
+    by_season: bool = False,
+) -> pd.DataFrame:
+    if team_game_stats is None or len(team_game_stats) == 0:
+        return pd.DataFrame()
+
+    recent = latest_n_games_by_group(
+        team_game_stats,
+        group_col="team_id",
+        n=n,
+        season_col="season" if by_season else None,
+    )
+
+    group_cols = ["season", "team_id"] if by_season else ["team_id"]
+    split_type = f"season_last{n}" if by_season else f"last{n}"
+
+    return aggregate_team_stats(recent, group_cols, split_type)
+
+
+# ============================================================
+# BUILD CLEAN TABLES AND CORE MARTS
+# ============================================================
+
+def build_clean_tables_and_core_marts(
+    discovery_tables: dict[str, pd.DataFrame],
+    stat_tables: dict[str, pd.DataFrame],
+) -> dict[str, dict[str, pd.DataFrame]]:
+    """
+    Main section-level builder for clean tables and core marts.
+    """
+
+    game_schedule_all = discovery_tables.get("game_schedule_all", pd.DataFrame()).copy()
+    game_schedule_2026 = discovery_tables.get("game_schedule_2026", pd.DataFrame()).copy()
+
+    raw_player_game_stats = stat_tables.get("player_game_stats", pd.DataFrame()).copy()
+    raw_team_game_stats = stat_tables.get("team_game_stats", pd.DataFrame()).copy()
+
+    player_game_stats = normalize_clean_player_game_stats(raw_player_game_stats)
+    team_game_stats = normalize_clean_team_game_stats(raw_team_game_stats)
+
+    team_directory = build_team_directory(game_schedule_all, team_game_stats)
+    player_directory = build_player_directory(player_game_stats)
+    game_manifest = build_game_manifest(game_schedule_all, team_game_stats, player_game_stats)
+
+    team_alias_mapping = pd.DataFrame([
+        {
+            "raw_team_id": raw_id,
+            "canonical_team_id": canonical_team_id(raw_id),
+            "raw_team_name": TEAM_NAME_LOOKUP_RAW.get(raw_id, raw_id),
+            "canonical_team_name": TEAM_NAME_CANONICAL_MAP.get(raw_id, raw_id),
+        }
+        for raw_id in sorted(set(list(TEAM_ID_CANONICAL_MAP.keys()) + list(TEAM_NAME_CANONICAL_MAP.keys())))
+    ])
+
+    # Player marts
+    player_season_stats = build_player_season_stats(player_game_stats)
+    player_season_stats_by_team = build_player_season_stats_by_team(player_game_stats)
+    player_career_stats = build_player_career_stats(player_game_stats)
+    player_last5_stats = build_player_recent_stats(player_game_stats, 5, by_season=False)
+    player_last10_stats = build_player_recent_stats(player_game_stats, 10, by_season=False)
+    player_season_last5_stats = build_player_recent_stats(player_game_stats, 5, by_season=True)
+    player_season_last10_stats = build_player_recent_stats(player_game_stats, 10, by_season=True)
+    player_vs_opponent_stats = build_player_vs_opponent_stats(player_game_stats)
+
+    # Team marts
+    team_season_stats = build_team_season_stats(team_game_stats)
+    team_career_stats = build_team_career_stats(team_game_stats)
+    team_last5_stats = build_team_recent_stats(team_game_stats, 5, by_season=False)
+    team_last10_stats = build_team_recent_stats(team_game_stats, 10, by_season=False)
+    team_season_last5_stats = build_team_recent_stats(team_game_stats, 5, by_season=True)
+    team_season_last10_stats = build_team_recent_stats(team_game_stats, 10, by_season=True)
+    team_vs_opponent_stats = build_team_vs_opponent_stats(team_game_stats)
+
+    clean_tables = {
+        "game_schedule_all": game_schedule_all,
+        "game_schedule_2026": game_schedule_2026,
+        "game_manifest": game_manifest,
+        "player_game_stats": player_game_stats,
+        "team_game_stats": team_game_stats,
+        "player_directory": player_directory,
+        "team_directory": team_directory,
+        "team_alias_mapping": team_alias_mapping,
+    }
+
+    marts = {
+        "player_season_stats": player_season_stats,
+        "player_season_stats_by_team": player_season_stats_by_team,
+        "player_career_stats": player_career_stats,
+        "player_last5_stats": player_last5_stats,
+        "player_last10_stats": player_last10_stats,
+        "player_season_last5_stats": player_season_last5_stats,
+        "player_season_last10_stats": player_season_last10_stats,
+        "player_vs_opponent_stats": player_vs_opponent_stats,
+        "team_season_stats": team_season_stats,
+        "team_career_stats": team_career_stats,
+        "team_last5_stats": team_last5_stats,
+        "team_last10_stats": team_last10_stats,
+        "team_season_last5_stats": team_season_last5_stats,
+        "team_season_last10_stats": team_season_last10_stats,
+        "team_vs_opponent_stats": team_vs_opponent_stats,
+    }
+
+    add_qc_check(
+        "clean_player_game_stats_rows",
+        "pass" if len(player_game_stats) > 0 else "warn",
+        len(player_game_stats),
+        None,
+        "Clean player-game rows.",
+    )
+
+    add_qc_check(
+        "clean_team_game_stats_rows",
+        "pass" if len(team_game_stats) > 0 else "warn",
+        len(team_game_stats),
+        None,
+        "Clean team-game rows.",
+    )
+
+    add_qc_check(
+        "game_manifest_rows",
+        "pass" if len(game_manifest) > 0 else "warn",
+        len(game_manifest),
+        None,
+        "Game manifest rows.",
+    )
+
+    if len(team_season_stats) > 0 and "wins" in team_season_stats.columns and "losses" in team_season_stats.columns:
+        bad_records = team_season_stats[
+            pd.to_numeric(team_season_stats["wins"], errors="coerce")
+            + pd.to_numeric(team_season_stats["losses"], errors="coerce")
+            != pd.to_numeric(team_season_stats["games"], errors="coerce")
+        ]
+
+        add_qc_check(
+            "team_record_wins_losses_match_games",
+            "pass" if len(bad_records) == 0 else "warn",
+            len(bad_records),
+            0,
+            "Team records should be based on final score and sum to games.",
+        )
+
+    if len(player_season_stats) > 0 and "save_pct_calc" in player_season_stats.columns:
+        invalid_save_pct = player_season_stats[
+            pd.to_numeric(player_season_stats["save_pct_calc"], errors="coerce") > 1
+        ]
+
+        add_qc_check(
+            "player_save_pct_range",
+            "pass" if len(invalid_save_pct) == 0 else "fail",
+            len(invalid_save_pct),
+            0,
+            "Goalie save percentages should not exceed 1.0.",
+        )
+
+    return {
+        "clean": clean_tables,
+        "marts": marts,
+    }
+
+
+# ============================================================
+# SECTION 2D COMPLETE
+# ============================================================
+
+# ============================================================
+# SECTION 2E — DEFENSIVE MARTS, RANKING MARTS, TEAM STYLE MARTS,
+#                DUCKDB EXPORT, AND MAIN RUNNER
+# ============================================================
+
+def robust_percentile(series: pd.Series, higher_is_better: bool = True) -> pd.Series:
+    """
+    Percentile on 0-100 scale. Handles empty/all-null data safely.
+    """
+
+    s = pd.to_numeric(series, errors="coerce")
+
+    if s.notna().sum() == 0:
+        return pd.Series(np.nan, index=series.index)
+
+    pct = s.rank(pct=True, ascending=not higher_is_better) * 100
+
+    return pct
+
+
+def minmax_score(series: pd.Series, higher_is_better: bool = True) -> pd.Series:
+    """
+    Min-max score on 0-100 scale. Safer than raw percentile for composite scoring.
+    """
+
+    s = pd.to_numeric(series, errors="coerce")
+
+    if s.notna().sum() == 0:
+        return pd.Series(np.nan, index=series.index)
+
+    min_v = s.min(skipna=True)
+    max_v = s.max(skipna=True)
+
+    if pd.isna(min_v) or pd.isna(max_v) or np.isclose(min_v, max_v):
+        return pd.Series(50.0, index=series.index).where(s.notna(), np.nan)
+
+    score = (s - min_v) / (max_v - min_v) * 100
+
+    if not higher_is_better:
+        score = 100 - score
+
+    return score.clip(0, 100)
+
+
+def robust_z_score(series: pd.Series) -> pd.Series:
+    """
+    Robust z-score using median and MAD. Falls back to standard deviation.
+    """
+
+    s = pd.to_numeric(series, errors="coerce")
+
+    if s.notna().sum() < 2:
+        return pd.Series(0.0, index=series.index).where(s.notna(), np.nan)
+
+    median = s.median(skipna=True)
+    mad = (s - median).abs().median(skipna=True)
+
+    if pd.isna(mad) or np.isclose(mad, 0):
+        std = s.std(skipna=True)
+
+        if pd.isna(std) or np.isclose(std, 0):
+            return pd.Series(0.0, index=series.index).where(s.notna(), np.nan)
+
+        return ((s - s.mean(skipna=True)) / std).clip(-4, 4)
+
+    return (0.6745 * (s - median) / mad).clip(-4, 4)
+
+
+def z_to_score(z: pd.Series) -> pd.Series:
+    """
+    Converts z-score style separation to 0-100 score.
+    50 = average peer separation.
+    """
+
+    z = pd.to_numeric(z, errors="coerce")
+    return (50 + 12.5 * z).clip(0, 100)
+
+
+def value_tier_from_z(z: Any) -> str:
+    try:
+        z = float(z)
+    except Exception:
+        return "Unrated"
+
+    if pd.isna(z):
+        return "Unrated"
+
+    if z >= 2.0:
+        return "Elite Separator"
+    if z >= 1.25:
+        return "High-End Separator"
+    if z >= 0.50:
+        return "Above-Average"
+    if z >= -0.50:
+        return "Average Range"
+    if z >= -1.25:
+        return "Below-Average"
+    return "Low-End"
+
+
+def label_from_score(score: Any, labels: tuple[str, str, str, str, str]) -> str:
+    try:
+        s = float(score)
+    except Exception:
+        return "Unrated"
+
+    if pd.isna(s):
+        return "Unrated"
+
+    if s >= 80:
+        return labels[0]
+    if s >= 65:
+        return labels[1]
+    if s >= 45:
+        return labels[2]
+    if s >= 30:
+        return labels[3]
+    return labels[4]
+
+
+def seconds_to_mmss(value: Any) -> Any:
+    try:
+        seconds = int(round(float(value)))
+    except Exception:
+        return pd.NA
+
+    if seconds < 0:
+        return pd.NA
+
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+# ============================================================
+# POSSESSION QUALITY / OPPONENT CONTEXT
+# ============================================================
+
+def build_game_possession_quality(team_game_stats: pd.DataFrame) -> pd.DataFrame:
+    if team_game_stats is None or len(team_game_stats) == 0:
+        return pd.DataFrame()
+
+    df = team_game_stats.copy()
+
+    for c in [
+        "time_in_possession",
+        "time_in_possession_pct",
+        "touches",
+        "total_passes",
+        "offensive_sequence_proxy",
+    ]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    group_cols = [c for c in ["season", "game_id", "game_slug", "game_number", "game_date_utc"] if c in df.columns]
+
+    if not group_cols:
+        return pd.DataFrame()
+
+    agg = (
+        df.groupby(group_cols, dropna=False)
+        .agg(
+            team_rows=("team_id", "count"),
+            combined_time_in_possession=("time_in_possession", "sum") if "time_in_possession" in df.columns else ("team_id", "size"),
+            combined_time_in_possession_pct=("time_in_possession_pct", "sum") if "time_in_possession_pct" in df.columns else ("team_id", "size"),
+            combined_touches=("touches", "sum") if "touches" in df.columns else ("team_id", "size"),
+            combined_passes=("total_passes", "sum") if "total_passes" in df.columns else ("team_id", "size"),
+            combined_offensive_sequence_proxy=("offensive_sequence_proxy", "sum") if "offensive_sequence_proxy" in df.columns else ("team_id", "size"),
+        )
+        .reset_index()
+    )
+
+    # Standard PLL game clock is 48:00 = 2880 seconds. OT/clock issues can exceed this.
+    agg["standard_clock_seconds"] = 2880
+    agg["dead_ball_or_untracked_seconds"] = agg["standard_clock_seconds"] - pd.to_numeric(
+        agg["combined_time_in_possession"],
+        errors="coerce",
+    )
+
+    agg["combined_time_mmss"] = agg["combined_time_in_possession"].apply(seconds_to_mmss)
+    agg["dead_ball_or_untracked_mmss"] = agg["dead_ball_or_untracked_seconds"].apply(seconds_to_mmss)
+
+    agg["possession_data_status"] = "normal"
+
+    agg.loc[
+        pd.to_numeric(agg["combined_time_in_possession"], errors="coerce").fillna(0).eq(0),
+        "possession_data_status",
+    ] = "missing_possession_time"
+
+    agg.loc[
+        pd.to_numeric(agg["combined_time_in_possession"], errors="coerce") > 2880,
+        "possession_data_status",
+    ] = "extended_or_ot_clock"
+
+    agg.loc[
+        (
+            pd.to_numeric(agg["combined_time_in_possession"], errors="coerce") < 2400
+        )
+        & (
+            pd.to_numeric(agg["combined_time_in_possession"], errors="coerce") > 0
+        ),
+        "possession_data_status",
+    ] = "short_or_provider_clock"
+
+    return agg.sort_values(["season", "game_number"], na_position="last").reset_index(drop=True)
+
+
+def build_possession_field_quality(team_game_stats: pd.DataFrame) -> pd.DataFrame:
+    if team_game_stats is None or len(team_game_stats) == 0:
+        return pd.DataFrame()
+
+    fields = [
+        "time_in_possession",
+        "time_in_possession_pct",
+        "touches",
+        "total_passes",
+        "total_possessions",
+        "official_total_possessions",
+        "offensive_sequence_proxy",
+    ]
+
+    rows = []
+
+    for field in fields:
+        if field not in team_game_stats.columns:
+            rows.append({
+                "field": field,
+                "exists": False,
+                "non_null_rows": 0,
+                "zero_rows": 0,
+                "coverage_rate": 0,
+                "notes": "field_missing",
+            })
+            continue
+
+        s = pd.to_numeric(team_game_stats[field], errors="coerce")
+
+        rows.append({
+            "field": field,
+            "exists": True,
+            "non_null_rows": int(s.notna().sum()),
+            "zero_rows": int(s.fillna(0).eq(0).sum()),
+            "total_rows": int(len(s)),
+            "coverage_rate": float(s.notna().mean()) if len(s) else np.nan,
+            "notes": "available",
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_team_game_opponent_context(team_game_stats: pd.DataFrame) -> pd.DataFrame:
+    if team_game_stats is None or len(team_game_stats) == 0:
+        return pd.DataFrame()
+
+    df = team_game_stats.copy()
+
+    context_cols = [
+        "season",
+        "game_id",
+        "game_slug",
+        "game_number",
+        "game_date_utc",
+        "team_id",
+        "team_name",
+        "opponent_team_id",
+        "opponent_team_name",
+        "scores",
+        "scores_against",
+        "goals",
+        "goals_against",
+        "shots",
+        "shots_against",
+        "shots_on_goal",
+        "shots_on_goal_against",
+        "turnovers",
+        "turnovers_against",
+        "caused_turnovers",
+        "caused_turnovers_against",
+        "saves",
+        "saves_against",
+        "touches",
+        "touches_against",
+        "total_passes",
+        "total_passes_against",
+        "time_in_possession",
+        "time_in_possession_against",
+        "offensive_sequence_proxy",
+        "offensive_sequence_proxy_against",
+        "score_based_win",
+        "score_based_loss",
+        "score_margin",
+    ]
+
+    context_cols = [c for c in context_cols if c in df.columns]
+    out = df[context_cols].copy()
+
+    if "scores" in out.columns and "scores_against" in out.columns:
+        out["score_margin"] = pd.to_numeric(out["scores"], errors="coerce") - pd.to_numeric(out["scores_against"], errors="coerce")
+
+    if "shots_against" in out.columns and "goals_against" in out.columns:
+        out["opponent_goal_pct"] = safe_divide(out["goals_against"], out["shots_against"])
+
+    if "shots_on_goal_against" in out.columns and "shots_against" in out.columns:
+        out["opponent_sog_rate"] = safe_divide(out["shots_on_goal_against"], out["shots_against"])
+
+    if "saves" in out.columns and "goals_against" in out.columns:
+        saves = pd.to_numeric(out["saves"], errors="coerce")
+        ga = pd.to_numeric(out["goals_against"], errors="coerce")
+        out["save_pct_proxy"] = (saves / (saves + ga).replace(0, np.nan)).clip(0, 1)
+
+    return out.sort_values(["season", "game_number", "team_name"], na_position="last").reset_index(drop=True)
+
+
+# ============================================================
+# DEFENSIVE MARTS
+# ============================================================
+
+def build_team_defense_stats(
+    team_game_stats: pd.DataFrame,
+    group_cols: list[str],
+    split_type: str,
+) -> pd.DataFrame:
+    if team_game_stats is None or len(team_game_stats) == 0:
+        return pd.DataFrame()
+
+    df = team_game_stats.copy()
+
+    needed_numeric = [
+        "scores_against",
+        "goals_against",
+        "shots_against",
+        "shots_on_goal_against",
+        "turnovers_against",
+        "touches_against",
+        "total_passes_against",
+        "offensive_sequence_proxy_against",
+        "caused_turnovers",
+        "saves",
+        "scores",
+    ]
+
+    for c in needed_numeric:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    agg_dict: dict[str, Any] = {}
+
+    if "game_id" in df.columns:
+        agg_dict["games"] = ("game_id", "nunique")
+    else:
+        agg_dict["games"] = ("team_id", "size")
+
+    if "team_name" in df.columns and "team_name" not in group_cols:
+        agg_dict["team_name"] = ("team_name", mode_or_first)
+
+    for c in needed_numeric:
+        if c in df.columns:
+            agg_dict[c] = (c, "sum")
+
+    out = df.groupby(group_cols, dropna=False).agg(**agg_dict).reset_index()
+
+    out["split_type"] = split_type
+
+    if len(out) == 0:
+        return out
+
+    games = pd.to_numeric(out["games"], errors="coerce").replace(0, np.nan)
+
+    if "scores_against" in out.columns:
+        out["scores_allowed_per_game"] = pd.to_numeric(out["scores_against"], errors="coerce") / games
+        out["def_scores_allowed_per_game"] = out["scores_allowed_per_game"]
+
+    if "goals_against" in out.columns:
+        out["goals_allowed_per_game"] = pd.to_numeric(out["goals_against"], errors="coerce") / games
+
+    if "shots_against" in out.columns:
+        out["opponent_shots_per_game"] = pd.to_numeric(out["shots_against"], errors="coerce") / games
+        out["def_opponent_shots_per_game"] = out["opponent_shots_per_game"]
+
+    if "shots_on_goal_against" in out.columns:
+        out["opponent_shots_on_goal_per_game"] = pd.to_numeric(out["shots_on_goal_against"], errors="coerce") / games
+
+    if "turnovers_against" in out.columns:
+        out["opponent_turnovers_per_game"] = pd.to_numeric(out["turnovers_against"], errors="coerce") / games
+
+    if "caused_turnovers" in out.columns:
+        out["caused_turnovers_for_per_game"] = pd.to_numeric(out["caused_turnovers"], errors="coerce") / games
+
+    if "scores" in out.columns and "scores_against" in out.columns:
+        out["score_margin"] = pd.to_numeric(out["scores"], errors="coerce") - pd.to_numeric(out["scores_against"], errors="coerce")
+        out["score_margin_per_game"] = out["score_margin"] / games
+
+    if "goals_against" in out.columns and "shots_against" in out.columns:
+        out["opponent_goal_pct"] = safe_divide(out["goals_against"], out["shots_against"])
+        out["def_opponent_goal_pct"] = out["opponent_goal_pct"]
+
+    if "shots_on_goal_against" in out.columns and "shots_against" in out.columns:
+        out["opponent_sog_rate"] = safe_divide(out["shots_on_goal_against"], out["shots_against"])
+
+    if "saves" in out.columns and "goals_against" in out.columns:
+        saves = pd.to_numeric(out["saves"], errors="coerce")
+        ga = pd.to_numeric(out["goals_against"], errors="coerce")
+        out["save_pct_proxy"] = (saves / (saves + ga).replace(0, np.nan)).clip(0, 1)
+        out["def_save_pct_proxy"] = out["save_pct_proxy"]
+
+    if "caused_turnovers" in out.columns and "turnovers_against" in out.columns:
+        out["ct_per_opponent_turnover"] = safe_divide(out["caused_turnovers"], out["turnovers_against"])
+
+    if "scores_against" in out.columns and "offensive_sequence_proxy_against" in out.columns:
+        out["opponent_scores_per_offensive_sequence_proxy"] = safe_divide(
+            out["scores_against"],
+            out["offensive_sequence_proxy_against"],
+        )
+
+    sort_cols = [c for c in ["season", "team_name", "team_id"] if c in out.columns]
+    if sort_cols:
+        out = out.sort_values(sort_cols, na_position="last").reset_index(drop=True)
+
+    return out
+
+
+def build_defensive_opponent_marts(
+    team_game_stats: pd.DataFrame,
+) -> dict[str, pd.DataFrame]:
+    team_game_opponent_context = build_team_game_opponent_context(team_game_stats)
+    team_game_possession_quality = build_game_possession_quality(team_game_stats)
+
+    team_defense_season_stats = build_team_defense_stats(
+        team_game_stats,
+        ["season", "team_id"],
+        "season",
+    )
+
+    team_defense_career_stats = build_team_defense_stats(
+        team_game_stats,
+        ["team_id"],
+        "career",
+    )
+
+    game_possession_quality = team_game_possession_quality.copy()
+    possession_field_quality = build_possession_field_quality(team_game_stats)
+
+    quality_rows_local = []
+
+    if len(team_defense_season_stats) > 0:
+        quality_rows_local.append({
+            "check_name": "team_defense_season_stats_rows",
+            "status": "pass",
+            "actual": len(team_defense_season_stats),
+            "expected": None,
+            "notes": "Defensive season rows created.",
+        })
+    else:
+        quality_rows_local.append({
+            "check_name": "team_defense_season_stats_rows",
+            "status": "warn",
+            "actual": 0,
+            "expected": None,
+            "notes": "No defensive season rows created.",
+        })
+
+    if len(game_possession_quality) > 0 and "possession_data_status" in game_possession_quality.columns:
+        non_normal = int((game_possession_quality["possession_data_status"] != "normal").sum())
+
+        quality_rows_local.append({
+            "check_name": "non_normal_possession_games",
+            "status": "warn" if non_normal else "pass",
+            "actual": non_normal,
+            "expected": 0,
+            "notes": "Non-normal possession data games are preserved and labeled.",
+        })
+
+    defensive_opponent_build_quality = pd.DataFrame(quality_rows_local)
+
+    return {
+        "team_game_opponent_context": team_game_opponent_context,
+        "team_game_possession_quality": team_game_possession_quality,
+        "team_defense_season_stats": team_defense_season_stats,
+        "team_defense_career_stats": team_defense_career_stats,
+        "game_possession_quality": game_possession_quality,
+        "possession_field_quality": possession_field_quality,
+        "defensive_opponent_build_quality": defensive_opponent_build_quality,
+    }
+
+
+# ============================================================
+# PLAYER RANKING MART
+# ============================================================
+
+def ranking_context_min_games(context_type: str, context_label: str, max_games: int) -> int:
+    if context_type in {"Last 5", "Last 10"}:
+        return 1
+
+    if context_type == "Career":
+        return 5 if max_games >= 5 else 1
+
+    # Dynamic early-season eligibility.
+    if max_games <= 2:
+        return 1
+
+    if max_games <= 5:
+        return 2
+
+    return 3
+
+
+def add_player_scores_for_context(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return df
+
+    out = df.copy()
+
+    # Ensure all key columns exist.
+    for c in [
+        "points_per_game",
+        "scoring_points_per_game",
+        "one_point_goals_per_game",
+        "two_point_goals_per_game",
+        "goals_per_game",
+        "assists_per_game",
+        "shots_per_game",
+        "ground_balls_per_game",
+        "turnovers_per_game",
+        "caused_turnovers_per_game",
+        "touches_per_game",
+        "faceoff_pct_calc",
+        "faceoffs_per_game",
+        "faceoffs_won_per_game",
+        "saves_per_game",
+        "goals_against_per_game",
+        "scores_against_per_game",
+        "save_pct_calc",
+        "games",
+    ]:
+        if c not in out.columns:
+            out[c] = np.nan
+
+    pos = out.get("position", pd.Series("", index=out.index)).astype(str).str.upper()
+
+    out["role_group"] = np.select(
+        [
+            pos.eq("G"),
+            pos.eq("FO"),
+            pos.isin(["D", "LSM", "SSDM"]),
+        ],
+        [
+            "Goalie",
+            "Faceoff",
+            "Defense",
+        ],
+        default="Offense",
+    )
+
+    # Core component scores.
+    out["goal_value_score"] = (
+        0.40 * minmax_score(out["scoring_points_per_game"], True).fillna(50)
+        + 0.20 * minmax_score(out["one_point_goals_per_game"], True).fillna(50)
+        + 0.25 * minmax_score(out["two_point_goals_per_game"], True).fillna(50)
+        + 0.15 * minmax_score(out["goals_per_game"], True).fillna(50)
+    ).clip(0, 100)
+
+    out["offensive_score"] = (
+        0.32 * minmax_score(out["points_per_game"], True).fillna(50)
+        + 0.22 * minmax_score(out["scoring_points_per_game"], True).fillna(50)
+        + 0.18 * minmax_score(out["assists_per_game"], True).fillna(50)
+        + 0.14 * minmax_score(out["shots_per_game"], True).fillna(50)
+        + 0.14 * out["goal_value_score"].fillna(50)
+    ).clip(0, 100)
+
+    out["usage_score"] = (
+        0.55 * minmax_score(out["touches_per_game"], True).fillna(50)
+        + 0.25 * minmax_score(out["shots_per_game"], True).fillna(50)
+        + 0.20 * minmax_score(out["ground_balls_per_game"], True).fillna(50)
+    ).clip(0, 100)
+
+    out["defensive_score"] = (
+        0.45 * minmax_score(out["caused_turnovers_per_game"], True).fillna(50)
+        + 0.35 * minmax_score(out["ground_balls_per_game"], True).fillna(50)
+        + 0.20 * minmax_score(out["turnovers_per_game"], False).fillna(50)
+    ).clip(0, 100)
+
+    out["faceoff_score"] = (
+        0.55 * minmax_score(out["faceoff_pct_calc"], True).fillna(50)
+        + 0.25 * minmax_score(out["faceoffs_won_per_game"], True).fillna(50)
+        + 0.20 * minmax_score(out["ground_balls_per_game"], True).fillna(50)
+    ).clip(0, 100)
+
+    out["goalie_score"] = (
+        0.50 * minmax_score(out["save_pct_calc"], True).fillna(50)
+        + 0.25 * minmax_score(out["saves_per_game"], True).fillna(50)
+        + 0.25 * minmax_score(out["goals_against_per_game"], False).fillna(50)
+    ).clip(0, 100)
+
+    out["role_primary_score"] = np.select(
+        [
+            out["role_group"].eq("Goalie"),
+            out["role_group"].eq("Faceoff"),
+            out["role_group"].eq("Defense"),
+            out["role_group"].eq("Offense"),
+        ],
+        [
+            out["goalie_score"],
+            out["faceoff_score"],
+            out["defensive_score"],
+            out["offensive_score"],
+        ],
+        default=out["offensive_score"],
+    )
+
+    # Role percentile and separation inside context/role.
+    out["role_primary_percentile"] = np.nan
+    out["role_robust_z"] = np.nan
+    out["role_adjusted_z"] = np.nan
+    out["role_separation_score"] = np.nan
+    out["role_group_size"] = np.nan
+
+    for role, idx in out.groupby("role_group", dropna=False).groups.items():
+        idx_list = list(idx)
+        role_scores = pd.to_numeric(out.loc[idx_list, "role_primary_score"], errors="coerce")
+
+        out.loc[idx_list, "role_primary_percentile"] = robust_percentile(role_scores, True).values
+        z = robust_z_score(role_scores)
+
+        out.loc[idx_list, "role_robust_z"] = z.values
+        out.loc[idx_list, "role_adjusted_z"] = z.values
+        out.loc[idx_list, "role_separation_score"] = z_to_score(z).values
+        out.loc[idx_list, "role_group_size"] = len(idx_list)
+
+    out["role_value_tier"] = out["role_adjusted_z"].apply(value_tier_from_z)
+
+    out["role_context_value_score"] = (
+        0.50 * pd.to_numeric(out["role_primary_score"], errors="coerce").fillna(50)
+        + 0.25 * pd.to_numeric(out["role_primary_percentile"], errors="coerce").fillna(50)
+        + 0.25 * pd.to_numeric(out["role_separation_score"], errors="coerce").fillna(50)
+    ).clip(0, 100)
+
+    # Base impact keeps offensive production meaningful but avoids having only scorers dominate.
+    out["base_impact_score"] = (
+        0.42 * out["offensive_score"].fillna(50)
+        + 0.18 * out["usage_score"].fillna(50)
+        + 0.16 * out["defensive_score"].fillna(50)
+        + 0.12 * out["faceoff_score"].fillna(50)
+        + 0.12 * out["goalie_score"].fillna(50)
+    ).clip(0, 100)
+
+    # Official ranking score. Internal names preserve app compatibility.
+    out["v22_overall_score"] = np.select(
+        [
+            out["role_group"].eq("Offense"),
+            out["role_group"].eq("Defense"),
+            out["role_group"].eq("Faceoff"),
+            out["role_group"].eq("Goalie"),
+        ],
+        [
+            0.62 * out["base_impact_score"] + 0.20 * out["role_context_value_score"] + 0.10 * out["usage_score"] + 0.08 * out["goal_value_score"],
+            0.60 * out["base_impact_score"] + 0.30 * out["role_context_value_score"] + 0.10 * out["usage_score"],
+            0.65 * out["base_impact_score"] + 0.25 * out["role_context_value_score"] + 0.10 * minmax_score(out["ground_balls_per_game"], True).fillna(50),
+            0.62 * out["base_impact_score"] + 0.38 * out["role_context_value_score"],
+        ],
+        default=out["base_impact_score"],
+    )
+
+    out["v22_overall_score"] = pd.to_numeric(out["v22_overall_score"], errors="coerce").clip(0, 100)
+
+    # Friendly duplicate names for app/table compatibility.
+    out["overall_score"] = out["v22_overall_score"]
+    out["overall_impact_score"] = out["v22_overall_score"]
+    out["usage_possession_score"] = out["usage_score"]
+    out["role_context_rank"] = np.nan
+    out["role_context_percentile"] = out["role_primary_percentile"]
+
+    return out
+
+
+def build_player_ranking_context(
+    df: pd.DataFrame,
+    context_type: str,
+    context_label: str,
+) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+
+    out = df.copy()
+
+    if "games" not in out.columns:
+        out["games"] = 0
+
+    max_games = int(pd.to_numeric(out["games"], errors="coerce").max()) if len(out) else 0
+    min_games = ranking_context_min_games(context_type, context_label, max_games)
+
+    out["ranking_context_type"] = context_type
+    out["ranking_context"] = context_label
+    out["max_games_in_context"] = max_games
+    out["default_min_games_used"] = min_games
+    out["is_ranking_eligible"] = (
+        pd.to_numeric(out["games"], errors="coerce").fillna(0) >= min_games
+    ).astype(int)
+
+    out["sample_size_note"] = np.where(
+        max_games <= 2,
+        "Early-season sample.",
+        "",
+    )
+
+    scored = add_player_scores_for_context(out)
+
+    eligible_mask = scored["is_ranking_eligible"].eq(1)
+
+    scored["v22_overall_rank"] = np.nan
+    scored["v22_position_rank"] = np.nan
+    scored["offensive_rank"] = np.nan
+    scored["defensive_rank"] = np.nan
+    scored["faceoff_rank"] = np.nan
+    scored["goalie_rank"] = np.nan
+
+    if eligible_mask.any():
+        scored.loc[eligible_mask, "v22_overall_rank"] = (
+            scored.loc[eligible_mask, "v22_overall_score"]
+            .rank(method="min", ascending=False)
+        )
+
+        scored.loc[eligible_mask, "v22_overall_percentile"] = robust_percentile(
+            scored.loc[eligible_mask, "v22_overall_score"],
+            True,
+        ).values
+
+        for position, idx in scored.loc[eligible_mask].groupby("position", dropna=False).groups.items():
+            idx_list = list(idx)
+            scored.loc[idx_list, "v22_position_rank"] = (
+                scored.loc[idx_list, "v22_overall_score"]
+                .rank(method="min", ascending=False)
+            )
+            scored.loc[idx_list, "v22_position_percentile"] = robust_percentile(
+                scored.loc[idx_list, "v22_overall_score"],
+                True,
+            ).values
+
+        scored.loc[eligible_mask, "offensive_rank"] = (
+            scored.loc[eligible_mask, "offensive_score"]
+            .rank(method="min", ascending=False)
+        )
+
+        defense_eligible = eligible_mask & scored["role_group"].eq("Defense")
+        if defense_eligible.any():
+            scored.loc[defense_eligible, "defensive_rank"] = (
+                scored.loc[defense_eligible, "defensive_score"]
+                .rank(method="min", ascending=False)
+            )
+
+        faceoff_eligible = eligible_mask & scored["role_group"].eq("Faceoff")
+        if faceoff_eligible.any():
+            scored.loc[faceoff_eligible, "faceoff_rank"] = (
+                scored.loc[faceoff_eligible, "faceoff_score"]
+                .rank(method="min", ascending=False)
+            )
+
+        goalie_eligible = eligible_mask & scored["role_group"].eq("Goalie")
+        if goalie_eligible.any():
+            scored.loc[goalie_eligible, "goalie_rank"] = (
+                scored.loc[goalie_eligible, "goalie_score"]
+                .rank(method="min", ascending=False)
+            )
+
+    # Friendly aliases expected by parts of the app.
+    scored["overall_rank"] = scored["v22_overall_rank"]
+    scored["overall_percentile"] = scored.get("v22_overall_percentile", np.nan)
+    scored["position_rank"] = scored["v22_position_rank"]
+    scored["position_percentile"] = scored.get("v22_position_percentile", np.nan)
+
+    return scored.sort_values(["ranking_context_type", "ranking_context", "v22_overall_rank"], na_position="last").reset_index(drop=True)
+
+
+def build_player_ranking_profiles(marts: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    contexts: list[pd.DataFrame] = []
+
+    career = marts.get("player_career_stats", pd.DataFrame())
+    if len(career) > 0:
+        contexts.append(build_player_ranking_context(career, "Career", "Career"))
+
+    last5 = marts.get("player_last5_stats", pd.DataFrame())
+    if len(last5) > 0:
+        contexts.append(build_player_ranking_context(last5, "Last 5", "Last 5"))
+
+    last10 = marts.get("player_last10_stats", pd.DataFrame())
+    if len(last10) > 0:
+        contexts.append(build_player_ranking_context(last10, "Last 10", "Last 10"))
+
+    season_stats = marts.get("player_season_stats", pd.DataFrame())
+    if len(season_stats) > 0 and "season" in season_stats.columns:
+        for season in sorted(pd.to_numeric(season_stats["season"], errors="coerce").dropna().astype(int).unique()):
+            season_df = season_stats[pd.to_numeric(season_stats["season"], errors="coerce") == season].copy()
+            contexts.append(build_player_ranking_context(season_df, "Season", f"{season} Season"))
+
+    if not contexts:
+        return pd.DataFrame()
+
+    out = pd.concat(contexts, ignore_index=True, sort=False)
+
+    # Round score columns.
+    score_cols = [c for c in out.columns if c.endswith("_score") or c.endswith("_percentile") or c.endswith("_rank")]
+    for c in score_cols:
+        out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
+
+    if "save_pct_calc" in out.columns:
+        out["save_pct"] = out["save_pct_calc"]
+
+    if "faceoff_pct_calc" in out.columns:
+        out["faceoff_pct"] = out["faceoff_pct_calc"]
+
+    add_qc_check(
+        "player_ranking_profiles_rows",
+        "pass" if len(out) > 0 else "warn",
+        len(out),
+        None,
+        "Player ranking profiles built.",
+    )
+
+    invalid_scores = out[
+        pd.to_numeric(out["v22_overall_score"], errors="coerce").lt(0)
+        | pd.to_numeric(out["v22_overall_score"], errors="coerce").gt(100)
+    ] if "v22_overall_score" in out.columns else pd.DataFrame()
+
+    add_qc_check(
+        "player_overall_score_range",
+        "pass" if len(invalid_scores) == 0 else "fail",
+        len(invalid_scores),
+        0,
+        "Player overall scores should be between 0 and 100.",
+    )
+
+    return out
+
+
+# ============================================================
+# TEAM STYLE MART
+# ============================================================
+
+def build_team_style_context(
+    team_stats: pd.DataFrame,
+    team_defense_stats: pd.DataFrame,
+    context_type: str,
+    context_label: str,
+) -> pd.DataFrame:
+    if team_stats is None or len(team_stats) == 0:
+        return pd.DataFrame()
+
+    teams = team_stats.copy()
+
+    defense = team_defense_stats.copy() if team_defense_stats is not None else pd.DataFrame()
+
+    if len(defense) > 0:
+        merge_keys = ["team_id"]
+
+        if "season" in teams.columns and "season" in defense.columns:
+            merge_keys = ["season", "team_id"]
+
+        keep_cols = [
+            c for c in [
+                *merge_keys,
+                "scores_allowed_per_game",
+                "goals_allowed_per_game",
+                "opponent_shots_per_game",
+                "def_opponent_shots_per_game",
+                "opponent_goal_pct",
+                "def_opponent_goal_pct",
+                "opponent_sog_rate",
+                "save_pct_proxy",
+                "def_save_pct_proxy",
+                "caused_turnovers_for_per_game",
+                "opponent_turnovers_per_game",
+                "ct_per_opponent_turnover",
+            ]
+            if c in defense.columns
+        ]
+
+        defense_small = defense[keep_cols].drop_duplicates(merge_keys)
+
+        teams = teams.merge(
+            defense_small,
+            on=merge_keys,
+            how="left",
+            suffixes=("", "_def"),
+        )
+
+    for c in [
+        "scores_per_game",
+        "shots_per_game",
+        "touches_per_game",
+        "time_in_possession_per_game",
+        "offensive_sequence_proxy_per_game",
+        "turnovers_per_game",
+        "assists_per_game",
+        "goals_per_game",
+        "scores_allowed_per_game",
+        "goals_allowed_per_game",
+        "opponent_shots_per_game",
+        "save_pct_proxy",
+        "faceoff_pct_calc",
+        "clear_pct_calc",
+        "score_margin_per_game",
+    ]:
+        if c not in teams.columns:
+            teams[c] = np.nan
+
+    teams["profile_context_type"] = context_type
+    teams["profile_context"] = context_label
+
+    teams["offensive_volume_score"] = (
+        0.35 * minmax_score(teams["scores_per_game"], True).fillna(50)
+        + 0.25 * minmax_score(teams["shots_per_game"], True).fillna(50)
+        + 0.20 * minmax_score(teams["touches_per_game"], True).fillna(50)
+        + 0.20 * minmax_score(teams["offensive_sequence_proxy_per_game"], True).fillna(50)
+    ).clip(0, 100)
+
+    teams["offensive_efficiency_score"] = (
+        0.45 * minmax_score(teams["scores_per_game"], True).fillna(50)
+        + 0.25 * minmax_score(teams.get("shot_pct_calc", pd.Series(np.nan, index=teams.index)), True).fillna(50)
+        + 0.20 * minmax_score(teams["turnovers_per_game"], False).fillna(50)
+        + 0.10 * minmax_score(teams["score_margin_per_game"], True).fillna(50)
+    ).clip(0, 100)
+
+    teams["ball_movement_score"] = (
+        0.55 * minmax_score(teams["assists_per_game"], True).fillna(50)
+        + 0.25 * minmax_score(teams.get("total_passes_per_game", pd.Series(np.nan, index=teams.index)), True).fillna(50)
+        + 0.20 * minmax_score(teams["touches_per_game"], True).fillna(50)
+    ).clip(0, 100)
+
+    teams["possession_control_score"] = (
+        0.45 * minmax_score(teams["touches_per_game"], True).fillna(50)
+        + 0.35 * minmax_score(teams["time_in_possession_per_game"], True).fillna(50)
+        + 0.20 * minmax_score(teams.get("faceoff_pct_calc", pd.Series(np.nan, index=teams.index)), True).fillna(50)
+    ).clip(0, 100)
+
+    teams["defensive_suppression_score"] = (
+        0.40 * minmax_score(teams["scores_allowed_per_game"], False).fillna(50)
+        + 0.25 * minmax_score(teams["opponent_shots_per_game"], False).fillna(50)
+        + 0.20 * minmax_score(teams["opponent_goal_pct"], False).fillna(50)
+        + 0.15 * minmax_score(teams["save_pct_proxy"], True).fillna(50)
+    ).clip(0, 100)
+
+    teams["pace_tempo_score"] = (
+        0.35 * minmax_score(teams["shots_per_game"], True).fillna(50)
+        + 0.30 * minmax_score(teams["touches_per_game"], True).fillna(50)
+        + 0.20 * minmax_score(teams["offensive_sequence_proxy_per_game"], True).fillna(50)
+        + 0.15 * minmax_score(teams["time_in_possession_per_game"], True).fillna(50)
+    ).clip(0, 100)
+
+    teams["team_style_overall_score"] = (
+        0.22 * teams["offensive_volume_score"]
+        + 0.20 * teams["offensive_efficiency_score"]
+        + 0.16 * teams["ball_movement_score"]
+        + 0.18 * teams["possession_control_score"]
+        + 0.18 * teams["defensive_suppression_score"]
+        + 0.06 * teams["pace_tempo_score"]
+    ).clip(0, 100)
+
+    teams["overall_score"] = teams["team_style_overall_score"]
+    teams["overall_style"] = teams["team_style_overall_score"]
+
+    teams["profile_rank"] = teams["team_style_overall_score"].rank(method="min", ascending=False)
+
+    if "scores_allowed_per_game" in teams.columns:
+        teams["def_scores_allowed_per_game"] = teams["scores_allowed_per_game"]
+
+    if "opponent_shots_per_game" in teams.columns:
+        teams["def_opponent_shots_per_game"] = teams["opponent_shots_per_game"]
+
+    if "save_pct_proxy" in teams.columns:
+        teams["def_save_pct_proxy"] = teams["save_pct_proxy"]
+
+    if "scores_per_game" in teams.columns and "scores_allowed_per_game" in teams.columns:
+        teams["net_scores_per_game"] = (
+            pd.to_numeric(teams["scores_per_game"], errors="coerce")
+            - pd.to_numeric(teams["scores_allowed_per_game"], errors="coerce")
+        )
+
+    if "time_in_possession_per_game" in teams.columns:
+        teams["time_in_possession_per_game_mmss"] = teams["time_in_possession_per_game"].apply(seconds_to_mmss)
+        teams["possession_pg"] = teams["time_in_possession_per_game_mmss"]
+
+    teams["pace_label"] = teams["pace_tempo_score"].apply(
+        lambda x: label_from_score(
+            x,
+            ("High Tempo", "Above-Average Tempo", "Balanced Tempo", "Slower Tempo", "Very Slow Tempo"),
+        )
+    )
+
+    teams["offensive_profile_label"] = teams["offensive_efficiency_score"].apply(
+        lambda x: label_from_score(
+            x,
+            ("Elite Offense", "Above-Average Offense", "Middle Tier", "Low-Output Offense", "Poor Offense"),
+        )
+    )
+
+    teams["defensive_profile_label"] = teams["defensive_suppression_score"].apply(
+        lambda x: label_from_score(
+            x,
+            ("Elite Defense", "Above-Average Defense", "Middle Tier", "Below-Average Defense", "Vulnerable Defense"),
+        )
+    )
+
+    teams["possession_profile_label"] = teams["possession_control_score"].apply(
+        lambda x: label_from_score(
+            x,
+            ("Elite Possession", "Above-Average Possession", "Middle Tier", "Below-Average Possession", "Poor Possession"),
+        )
+    )
+
+    teams["style_summary"] = (
+        teams["pace_label"].astype(str)
+        + " | "
+        + teams["offensive_profile_label"].astype(str)
+        + " | "
+        + teams["defensive_profile_label"].astype(str)
+        + " | "
+        + teams["possession_profile_label"].astype(str)
+    )
+
+    teams["sample_size_note"] = np.where(
+        pd.to_numeric(teams.get("games", pd.Series(0, index=teams.index)), errors="coerce").fillna(0) <= 2,
+        "Early-season sample.",
+        "",
+    )
+
+    score_cols = [
+        "team_style_overall_score",
+        "overall_score",
+        "offensive_volume_score",
+        "offensive_efficiency_score",
+        "ball_movement_score",
+        "possession_control_score",
+        "defensive_suppression_score",
+        "pace_tempo_score",
+        "profile_rank",
+    ]
+
+    for c in score_cols:
+        if c in teams.columns:
+            teams[c] = pd.to_numeric(teams[c], errors="coerce").round(2)
+
+    return teams.sort_values(["profile_context_type", "profile_context", "profile_rank"], na_position="last").reset_index(drop=True)
+
+
+def build_team_style_profiles(
+    marts: dict[str, pd.DataFrame],
+    defense_marts: dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    contexts: list[pd.DataFrame] = []
+
+    career = marts.get("team_career_stats", pd.DataFrame())
+    career_def = defense_marts.get("team_defense_career_stats", pd.DataFrame())
+
+    if len(career) > 0:
+        contexts.append(build_team_style_context(career, career_def, "Career", "Career"))
+
+    season_stats = marts.get("team_season_stats", pd.DataFrame())
+    season_def = defense_marts.get("team_defense_season_stats", pd.DataFrame())
+
+    if len(season_stats) > 0 and "season" in season_stats.columns:
+        for season in sorted(pd.to_numeric(season_stats["season"], errors="coerce").dropna().astype(int).unique()):
+            s_df = season_stats[pd.to_numeric(season_stats["season"], errors="coerce") == season].copy()
+
+            if len(season_def) > 0 and "season" in season_def.columns:
+                d_df = season_def[pd.to_numeric(season_def["season"], errors="coerce") == season].copy()
+            else:
+                d_df = pd.DataFrame()
+
+            contexts.append(build_team_style_context(s_df, d_df, "Season", f"{season} Season"))
+
+    if not contexts:
+        return pd.DataFrame()
+
+    out = pd.concat(contexts, ignore_index=True, sort=False)
+
+    add_qc_check(
+        "team_style_profiles_rows",
+        "pass" if len(out) > 0 else "warn",
+        len(out),
+        None,
+        "Team style profiles built.",
+    )
+
+    invalid_scores = out[
+        pd.to_numeric(out["team_style_overall_score"], errors="coerce").lt(0)
+        | pd.to_numeric(out["team_style_overall_score"], errors="coerce").gt(100)
+    ] if "team_style_overall_score" in out.columns else pd.DataFrame()
+
+    add_qc_check(
+        "team_style_score_range",
+        "pass" if len(invalid_scores) == 0 else "fail",
+        len(invalid_scores),
+        0,
+        "Team style scores should be between 0 and 100.",
+    )
+
+    return out
+
+
+# ============================================================
+# ARTIFACT + DUCKDB EXPORT
+# ============================================================
+
+def write_all_artifacts_and_duckdb(
+    clean_tables: dict[str, pd.DataFrame],
+    marts: dict[str, pd.DataFrame],
+    qc_tables: dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    artifact_rows: list[dict[str, Any]] = []
+
+    # Write clean tables.
+    for name, df in clean_tables.items():
+        write_table_artifacts(name, df, artifact_rows)
+
+    # Write marts.
+    for name, df in marts.items():
+        write_table_artifacts(name, df, artifact_rows)
+
+    # Write QC tables.
+    for name, df in qc_tables.items():
+        write_table_artifacts(name, df, artifact_rows)
+
+    table_index = pd.DataFrame(artifact_rows)
+    table_index_path = CURATED_ALL_DIR / "duckdb_table_index.csv"
+    table_index.to_csv(table_index_path, index=False)
+
+    # Recreate DuckDB.
+    if DB_PATH.exists():
+        DB_PATH.unlink()
+
+    con = duckdb.connect(str(DB_PATH))
+
+    try:
+        # Clean schema.
+        for table_name in clean_tables.keys():
+            duckdb_load_parquet(con, "clean", table_name)
+
+        # Marts schema.
+        for table_name in marts.keys():
+            duckdb_load_parquet(con, "marts", table_name)
+
+        # QC schema.
+        for table_name in qc_tables.keys():
+            duckdb_load_parquet(con, "qc", table_name)
+
+        # Convenience table index.
+        con.execute("CREATE SCHEMA IF NOT EXISTS qc;")
+        con.execute(
+            f"""
+            CREATE OR REPLACE TABLE qc.duckdb_table_index AS
+            SELECT *
+            FROM read_csv_auto('{table_index_path.as_posix()}');
+            """
+        )
+
+        # Basic sanity view.
+        con.execute("""
+            CREATE OR REPLACE VIEW qc.table_counts AS
+            SELECT 'clean' AS schema_name, table_name, row_count
+            FROM (
+                SELECT table_name, estimated_size AS row_count
+                FROM duckdb_tables()
+                WHERE schema_name = 'clean'
+            )
+            UNION ALL
+            SELECT 'marts' AS schema_name, table_name, row_count
+            FROM (
+                SELECT table_name, estimated_size AS row_count
+                FROM duckdb_tables()
+                WHERE schema_name = 'marts'
+            )
+            UNION ALL
+            SELECT 'qc' AS schema_name, table_name, row_count
+            FROM (
+                SELECT table_name, estimated_size AS row_count
+                FROM duckdb_tables()
+                WHERE schema_name = 'qc'
+            );
+        """)
+
+    finally:
+        con.close()
+
+    add_qc_check(
+        "duckdb_created",
+        "pass" if DB_PATH.exists() else "fail",
+        str(DB_PATH),
+        "file_exists",
+        "DuckDB warehouse file created.",
+    )
+
+    return table_index
+
+
+# ============================================================
+# FINAL QC
+# ============================================================
+
+def build_final_qc_tables(
+    discovery_tables: dict[str, pd.DataFrame],
+    stat_tables: dict[str, pd.DataFrame],
+    clean_tables: dict[str, pd.DataFrame],
+    marts: dict[str, pd.DataFrame],
+    defense_marts: dict[str, pd.DataFrame],
+) -> dict[str, pd.DataFrame]:
+    # Add high-level expected table checks.
+    required_clean = [
+        "game_manifest",
+        "game_schedule_all",
+        "player_game_stats",
+        "team_game_stats",
+        "player_directory",
+        "team_directory",
+    ]
+
+    required_marts = [
+        "player_season_stats",
+        "player_season_stats_by_team",
+        "player_career_stats",
+        "player_last5_stats",
+        "player_last10_stats",
+        "team_season_stats",
+        "team_career_stats",
+        "team_defense_season_stats",
+        "team_defense_career_stats",
+        "player_ranking_profiles",
+        "team_style_profiles",
+    ]
+
+    for t in required_clean:
+        df = clean_tables.get(t, pd.DataFrame())
+        add_qc_check(
+            f"clean_{t}_exists",
+            "pass" if len(df) > 0 else "warn",
+            len(df),
+            ">0 rows",
+            "Required clean table check.",
+        )
+
+    for t in required_marts:
+        df = marts.get(t, pd.DataFrame()) if t in marts else defense_marts.get(t, pd.DataFrame())
+        add_qc_check(
+            f"marts_{t}_exists",
+            "pass" if len(df) > 0 else "warn",
+            len(df),
+            ">0 rows",
+            "Required marts table check.",
+        )
+
+    # Duplicate keys.
+    player_game = clean_tables.get("player_game_stats", pd.DataFrame())
+    if len(player_game) > 0:
+        dup_cols = [c for c in ["season", "game_id", "player_id", "team_id"] if c in player_game.columns]
+
+        if dup_cols:
+            dup_count = int(player_game.duplicated(dup_cols).sum())
+            add_qc_check(
+                "duplicate_clean_player_game_keys",
+                "pass" if dup_count == 0 else "warn",
+                dup_count,
+                0,
+                "Duplicate clean player-game keys.",
+            )
+
+    team_game = clean_tables.get("team_game_stats", pd.DataFrame())
+    if len(team_game) > 0:
+        dup_cols = [c for c in ["season", "game_id", "team_id"] if c in team_game.columns]
+
+        if dup_cols:
+            dup_count = int(team_game.duplicated(dup_cols).sum())
+            add_qc_check(
+                "duplicate_clean_team_game_keys",
+                "pass" if dup_count == 0 else "warn",
+                dup_count,
+                0,
+                "Duplicate clean team-game keys.",
+            )
+
+    ranking = marts.get("player_ranking_profiles", pd.DataFrame())
+    if len(ranking) > 0:
+        key_cols = [c for c in ["ranking_context", "player_id", "team_id"] if c in ranking.columns]
+
+        if "team_id" not in key_cols:
+            key_cols = [c for c in ["ranking_context", "player_id"] if c in ranking.columns]
+
+        if key_cols:
+            dup_count = int(ranking.duplicated(key_cols).sum())
+            add_qc_check(
+                "duplicate_player_ranking_context_keys",
+                "pass" if dup_count == 0 else "warn",
+                dup_count,
+                0,
+                "Duplicate ranking rows by context/player.",
+            )
+
+    team_style = marts.get("team_style_profiles", pd.DataFrame())
+    if len(team_style) > 0:
+        key_cols = [c for c in ["profile_context", "team_id"] if c in team_style.columns]
+
+        if key_cols:
+            dup_count = int(team_style.duplicated(key_cols).sum())
+            add_qc_check(
+                "duplicate_team_style_context_keys",
+                "pass" if dup_count == 0 else "warn",
+                dup_count,
+                0,
+                "Duplicate team style rows by context/team.",
+            )
+
+    quality_summary = pd.DataFrame(quality_rows)
+
+    if len(quality_summary) == 0:
+        quality_summary = pd.DataFrame([{
+            "check_name": "quality_summary_created",
+            "status": "warn",
+            "actual": 0,
+            "expected": ">0",
+            "notes": "No QC checks were created.",
+            "run_id": RUN_ID,
+            "checked_at_utc": now_utc_iso(),
+        }])
+
+    qc_tables = {
+        "quality_summary": quality_summary,
+        "api_collection_log": stat_tables.get("api_collection_log", pd.DataFrame()),
+        "event_list_probe_summary": discovery_tables.get("event_list_probe_summary", pd.DataFrame()),
+        "game_discovery_log": discovery_tables.get("game_discovery_log", pd.DataFrame()),
+        "season_slug_inventory": discovery_tables.get("season_slug_inventory", pd.DataFrame()),
+        "season_schedule_inventory": discovery_tables.get("game_schedule_all", pd.DataFrame()),
+        "skipped_games": stat_tables.get("skipped_games", pd.DataFrame()),
+        "game_possession_quality": defense_marts.get("game_possession_quality", pd.DataFrame()),
+        "possession_field_quality": defense_marts.get("possession_field_quality", pd.DataFrame()),
+        "defensive_opponent_build_quality": defense_marts.get("defensive_opponent_build_quality", pd.DataFrame()),
+        # Placeholders for app compatibility if older app tabs expect these.
+        "stat_slug_inventory": pd.DataFrame(),
+    }
+
+    return qc_tables
+
+
+# ============================================================
+# MAIN RUNNER
+# ============================================================
+
+def main() -> None:
+    print_startup_summary()
+    require_api_token()
+
+    print("\nSTEP 1 — Discovering games and schedules...")
+    discovery_tables = discover_all_games(TARGET_SEASONS)
+
+    print("\nSTEP 2 — Collecting and parsing player/team stats...")
+    stat_tables = collect_game_stats(discovery_tables["game_schedule_all"])
+
+    print("\nSTEP 3 — Building clean tables and core marts...")
+    built = build_clean_tables_and_core_marts(discovery_tables, stat_tables)
+
+    clean_tables = built["clean"]
+    marts = built["marts"]
+
+    print("\nSTEP 4 — Building defensive/opponent and possession marts...")
+    defense_marts = build_defensive_opponent_marts(clean_tables.get("team_game_stats", pd.DataFrame()))
+
+    # Add defensive marts to marts dict.
+    for key in [
+        "team_game_opponent_context",
+        "team_game_possession_quality",
+        "team_defense_season_stats",
+        "team_defense_career_stats",
+    ]:
+        marts[key] = defense_marts.get(key, pd.DataFrame())
+
+    print("\nSTEP 5 — Building player ranking profiles...")
+    player_ranking_profiles = build_player_ranking_profiles(marts)
+    marts["player_ranking_profiles"] = player_ranking_profiles
+
+    print("\nSTEP 6 — Building team style profiles...")
+    team_style_profiles = build_team_style_profiles(marts, defense_marts)
+    marts["team_style_profiles"] = team_style_profiles
+
+    print("\nSTEP 7 — Building final QC tables...")
+    qc_tables = build_final_qc_tables(
+        discovery_tables=discovery_tables,
+        stat_tables=stat_tables,
+        clean_tables=clean_tables,
+        marts=marts,
+        defense_marts=defense_marts,
+    )
+
+    print("\nSTEP 8 — Writing parquet/csv artifacts and DuckDB warehouse...")
+    table_index = write_all_artifacts_and_duckdb(
+        clean_tables=clean_tables,
+        marts=marts,
+        qc_tables=qc_tables,
+    )
+
+    print("\nWarehouse build complete.")
+    print("DuckDB path:", DB_PATH)
+    print("Tables written:", len(table_index))
+
+    print("\nTable index preview:")
+    try:
+        print(table_index[["table_name", "rows", "columns"]].sort_values("table_name").to_string(index=False))
+    except Exception:
+        print(table_index.head().to_string(index=False))
+
+    print("\nQC summary:")
+    try:
+        qc_summary = pd.DataFrame(quality_rows)
+        print(qc_summary[["check_name", "status", "actual", "expected", "notes"]].to_string(index=False))
+    except Exception:
+        print("QC summary unavailable.")
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+# ============================================================
+# SECTION 2E COMPLETE
+# ============================================================
