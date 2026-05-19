@@ -1,0 +1,73 @@
+name: Update PLL Warehouse
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_recollect:
+        description: "Force re-download API responses instead of using cached raw JSON"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      force_rediscover:
+        description: "Force schedule rediscovery"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+  schedule:
+    # Sunday night at midnight EST = Monday 05:00 UTC.
+    - cron: "0 5 * * 1"
+    # Friday morning at 8:00 AM EST = Friday 13:00 UTC.
+    - cron: "0 13 * * 5"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pll-warehouse-update
+  cancel-in-progress: false
+
+jobs:
+  build-warehouse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build PLL warehouse
+        env:
+          PLL_BEARER_TOKEN: ${{ secrets.PLL_BEARER_TOKEN }}
+          PLL_FORCE_RECOLLECT: ${{ github.event.inputs.force_recollect || 'false' }}
+          PLL_FORCE_REDISCOVER: ${{ github.event.inputs.force_rediscover || 'false' }}
+        run: python scripts/build_warehouse.py
+
+      - name: Commit updated warehouse artifacts
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "No data changes to commit."
+          else
+            git commit -m "Update PLL warehouse artifacts"
+            git push
+          fi
