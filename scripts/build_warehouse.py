@@ -1,6 +1,6 @@
 # PLL DATA PLATFORM — WAREHOUSE BUILDER
 # ============================================================
-# SECTION 2A — IMPORTS, CONFIG, PATHS, CONSTANTS, AND SHARED HELPERS
+# SECTION 2A — IMPORTS, CONFIG, PATHS, TOKEN, SESSION, HELPERS
 # ============================================================
 
 from __future__ import annotations
@@ -26,11 +26,12 @@ from tqdm.auto import tqdm
 
 
 # ============================================================
-# PANDAS / DISPLAY CONFIG
+# PANDAS CONFIG
 # ============================================================
 
 pd.set_option("display.max_columns", 500)
 pd.set_option("display.width", 240)
+pd.set_option("display.max_colwidth", 250)
 
 
 # ============================================================
@@ -42,9 +43,11 @@ PROJECT_ROOT = REPO_ROOT / "data"
 
 SOURCE_DATA_DIR = PROJECT_ROOT / "source_data"
 SOURCE_DIR = SOURCE_DATA_DIR
-
 API_RESPONSES_DIR = SOURCE_DATA_DIR / "api_responses"
-REFERENCE_DOWNLOADS_DIR = SOURCE_DATA_DIR / "reference_downloads"
+
+STANDARDIZED_DATA_DIR = PROJECT_ROOT / "standardized_data"
+GAME_TABLES_DIR = STANDARDIZED_DATA_DIR / "game_tables"
+REFERENCE_TABLES_DIR = STANDARDIZED_DATA_DIR / "reference_tables"
 
 CURATED_DATA_DIR = PROJECT_ROOT / "curated_data"
 CURATED_ALL_DIR = CURATED_DATA_DIR / "all_requested_seasons"
@@ -53,6 +56,9 @@ ANALYTICS_DATABASE_DIR = PROJECT_ROOT / "analytics_database"
 DB_PATH = ANALYTICS_DATABASE_DIR / "pll_warehouse.duckdb"
 
 QUALITY_CHECKS_DIR = PROJECT_ROOT / "quality_checks"
+CONFIG_DIR = PROJECT_ROOT / "config"
+EXPORT_DIR = PROJECT_ROOT / "exports"
+
 RUN_ID = datetime.now(timezone.utc).strftime("run_%Y%m%d_%H%M%S")
 RUN_CHECK_DIR = QUALITY_CHECKS_DIR / RUN_ID
 
@@ -60,12 +66,16 @@ for path in [
     PROJECT_ROOT,
     SOURCE_DATA_DIR,
     API_RESPONSES_DIR,
-    REFERENCE_DOWNLOADS_DIR,
+    STANDARDIZED_DATA_DIR,
+    GAME_TABLES_DIR,
+    REFERENCE_TABLES_DIR,
     CURATED_DATA_DIR,
     CURATED_ALL_DIR,
     ANALYTICS_DATABASE_DIR,
     QUALITY_CHECKS_DIR,
     RUN_CHECK_DIR,
+    CONFIG_DIR,
+    EXPORT_DIR,
 ]:
     path.mkdir(parents=True, exist_ok=True)
 
@@ -108,28 +118,55 @@ def env_int_list(name: str, default: list[int]) -> list[int]:
 TARGET_SEASONS = env_int_list("PLL_TARGET_SEASONS", [2022, 2023, 2024, 2025, 2026])
 COMPETITION_TYPE = os.getenv("PLL_COMPETITION_TYPE", "regular").strip().lower()
 
+EXPECTED_REGULAR_GAMES = {
+    2022: 40,
+    2023: 40,
+    2024: 40,
+    2025: 40,
+    2026: None,
+}
+
 FORCE_RECOLLECT = env_bool("PLL_FORCE_RECOLLECT", False)
 FORCE_REDISCOVER = env_bool("PLL_FORCE_REDISCOVER", False)
 
 REQUEST_SLEEP_SECONDS = float(os.getenv("PLL_REQUEST_SLEEP_SECONDS", "0.10"))
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("PLL_REQUEST_TIMEOUT_SECONDS", "30"))
-MAX_RETRIES = int(os.getenv("PLL_MAX_RETRIES", "3"))
+MAX_RETRIES = int(os.getenv("PLL_MAX_RETRIES", "4"))
 
-PLL_API_BASE_URL = os.getenv(
-    "PLL_API_BASE_URL",
+PLL_STATS_SITE = os.getenv(
+    "PLL_STATS_SITE",
     "https://stats.premierlacrosseleague.com",
 ).rstrip("/")
 
+PLL_API_BASE = os.getenv(
+    "PLL_API_BASE",
+    "https://api.stats.premierlacrosseleague.com/api/v4",
+).rstrip("/")
+
+PLL_API_BASE_URL = PLL_API_BASE
+
+TIME_ZONE = os.getenv("PLL_TIME_ZONE", "America/Los_Angeles")
+
+MANUAL_SLUG_INVENTORY_FILE = CONFIG_DIR / "manual_slug_inventory.csv"
+
 
 # ============================================================
-# TOKEN / REQUEST SESSION
+# TOKEN / HTTP SESSION
 # ============================================================
+
+def clean_token_value(value: Any) -> str:
+    if value is None:
+        return ""
+
+    token = str(value).strip()
+    token = token.replace("^", "").strip()
+    token = re.sub(r"\s+", " ", token).strip()
+
+    return token
+
 
 def normalize_bearer_token(raw_token: Optional[str]) -> Optional[str]:
-    if raw_token is None:
-        return None
-
-    token = str(raw_token).strip()
+    token = clean_token_value(raw_token)
 
     if not token:
         return None
@@ -148,18 +185,45 @@ RAW_PLL_TOKEN = (
 
 PLL_BEARER_TOKEN = normalize_bearer_token(RAW_PLL_TOKEN)
 
-SESSION = requests.Session()
 
-SESSION.headers.update({
-    "accept": "application/json, text/plain, */*",
-    "content-type": "application/json",
-    "user-agent": "PLL-Data-Platform/1.0",
-})
+def token_preview(token: Optional[str]) -> str:
+    if not token:
+        return "MISSING"
 
-if PLL_BEARER_TOKEN:
-    SESSION.headers.update({
-        "authorization": PLL_BEARER_TOKEN,
-    })
+    return "SET"
+
+
+def build_session(bearer_token: Optional[str] = None) -> requests.Session:
+    session = requests.Session()
+
+    headers = {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "cache-control": "no-cache",
+        "content-type": "application/json",
+        "origin": PLL_STATS_SITE,
+        "pragma": "no-cache",
+        "referer": f"{PLL_STATS_SITE}/",
+        "time-zone": TIME_ZONE,
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/146.0.0.0 Safari/537.36"
+        ),
+    }
+
+    normalized = normalize_bearer_token(bearer_token)
+
+    if normalized:
+        headers["authorization"] = normalized
+        headers["authsource"] = "stats"
+
+    session.headers.update(headers)
+
+    return session
+
+
+SESSION = build_session(PLL_BEARER_TOKEN)
 
 
 def require_api_token() -> None:
@@ -170,8 +234,12 @@ def require_api_token() -> None:
         )
 
 
+# ============================================================
+# STARTUP / QC HELPERS
+# ============================================================
+
 def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def print_startup_summary() -> None:
@@ -188,14 +256,10 @@ def print_startup_summary() -> None:
     print("Force recollect:", FORCE_RECOLLECT)
     print("Force rediscover:", FORCE_REDISCOVER)
     print("Token loaded:", bool(PLL_BEARER_TOKEN))
-    print("Token preview:", "SET" if PLL_BEARER_TOKEN else "MISSING")
+    print("Token preview:", token_preview(PLL_BEARER_TOKEN))
     print("Authorization header present:", "authorization" in SESSION.headers)
     print("=" * 90)
 
-
-# ============================================================
-# QUALITY CHECK TRACKING
-# ============================================================
 
 quality_rows: list[dict[str, Any]] = []
 
@@ -219,35 +283,58 @@ def add_qc_check(
 
 
 # ============================================================
+# PLL API URL BUILDERS
+# ============================================================
+
+def event_list_url(year: Any, season_segment: str = COMPETITION_TYPE) -> str:
+    return f"{PLL_API_BASE}/events?year={year}&seasonSegment={season_segment}"
+
+
+def event_summary_url(slug: Any) -> str:
+    return f"{PLL_API_BASE}/events/{slug}"
+
+
+def player_game_stats_url(slug: Any) -> str:
+    return f"{PLL_API_BASE}/events/{slug}/players/stats"
+
+
+def team_game_stats_url(slug: Any) -> str:
+    return f"{PLL_API_BASE}/events/{slug}/teams/stats"
+
+
+def event_list_cache(season: Any) -> Path:
+    return API_RESPONSES_DIR / f"season_{season}" / "event_list.json.gz"
+
+
+# ============================================================
 # TEAM CANONICALIZATION
 # ============================================================
 
 TEAM_ID_CANONICAL_MAP = {
+    "ATL": "ATL",
+    "ATLAS": "ATL",
+
     "ARC": "ARC",
     "ARCHERS": "ARC",
 
-    "ATL": "ATL",
-    "ATS": "ATL",
-    "ATLAS": "ATL",
-
     "BOS": "CAN",
     "BOSTON": "CAN",
+    "BOSTON CANNONS": "CAN",
     "CAN": "CAN",
     "CANNONS": "CAN",
-    "BOSTON CANNONS": "CAN",
 
     "CHA": "CHA",
     "CHS": "CHA",
     "CHAOS": "CHA",
 
-    "CHR": "CHR",
-    "CHROME": "CHR",
+    "CHR": "OUT",
+    "CHROME": "OUT",
 
-    "OUT": "OUT",
     "DEN": "OUT",
     "DENVER": "OUT",
-    "OUTLAWS": "OUT",
     "DENVER OUTLAWS": "OUT",
+    "OUT": "OUT",
+    "OUTLAWS": "OUT",
 
     "RED": "RED",
     "RW": "RED",
@@ -264,23 +351,11 @@ TEAM_ID_CANONICAL_MAP = {
 }
 
 TEAM_NAME_CANONICAL_MAP = {
-    "ARC": "Archers",
     "ATL": "Atlas",
+    "ARC": "Archers",
     "CAN": "Cannons",
     "CHA": "Chaos",
-    "CHR": "Chrome",
-    "OUT": "Outlaws",
-    "RED": "Redwoods",
-    "WAT": "Waterdogs",
-    "WHP": "Whipsnakes",
-}
-
-TEAM_DISPLAY_NAME_LOOKUP = {
-    "ARC": "Archers",
-    "ATL": "Atlas",
-    "CAN": "Cannons",
-    "CHA": "Chaos",
-    "CHR": "Chrome",
+    "CHR": "Outlaws",
     "OUT": "Outlaws",
     "RED": "Redwoods",
     "WAT": "Waterdogs",
@@ -288,81 +363,136 @@ TEAM_DISPLAY_NAME_LOOKUP = {
 }
 
 TEAM_NAME_LOOKUP_RAW = {
-    "ARC": "Archers",
     "ATL": "Atlas",
+    "ARC": "Archers",
     "BOS": "Boston Cannons",
     "CAN": "Cannons",
     "CHA": "Chaos",
     "CHR": "Chrome",
-    "OUT": "Outlaws",
     "DEN": "Denver Outlaws",
+    "OUT": "Outlaws",
     "RED": "Redwoods",
     "WAT": "Waterdogs",
     "WHP": "Whipsnakes",
     "WHI": "Whipsnakes",
 }
 
+TEAM_DISPLAY_NAME_LOOKUP = {
+    "ATL": "New York Atlas",
+    "ARC": "Utah Archers",
+    "CAN": "Boston Cannons",
+    "CHA": "Carolina Chaos",
+    "OUT": "Denver Outlaws",
+    "RED": "California Redwoods",
+    "WAT": "Philadelphia Waterdogs",
+    "WHP": "Maryland Whipsnakes",
+}
 
-def canonical_team_id(value: Any) -> Any:
-    if value is None or pd.isna(value):
+
+def canonical_team_id(team_id: Any) -> Any:
+    if team_id is None:
         return pd.NA
 
-    raw = str(value).strip()
+    try:
+        if pd.isna(team_id):
+            return pd.NA
+    except Exception:
+        pass
+
+    raw = str(team_id).strip()
 
     if raw == "":
         return pd.NA
 
     key = re.sub(r"[^A-Za-z0-9]+", " ", raw).strip().upper()
+    compact = key.replace(" ", "")
 
     if key in TEAM_ID_CANONICAL_MAP:
         return TEAM_ID_CANONICAL_MAP[key]
 
-    compact = key.replace(" ", "")
-
     if compact in TEAM_ID_CANONICAL_MAP:
         return TEAM_ID_CANONICAL_MAP[compact]
-
-    for name_key, team_id in TEAM_ID_CANONICAL_MAP.items():
-        if name_key in key or key in name_key:
-            return team_id
 
     return compact[:12]
 
 
-def canonical_team_name(team_id: Any, fallback_name: Any = None) -> Any:
-    tid = canonical_team_id(team_id)
+def canonical_team_name(team_id_raw: Any, fallback_name: Any = None) -> Any:
+    tid = canonical_team_id(team_id_raw)
 
-    if tid is not pd.NA and not pd.isna(tid):
+    try:
+        is_missing = pd.isna(tid)
+    except Exception:
+        is_missing = tid is None
+
+    if not is_missing:
         tid_str = str(tid)
 
         if tid_str in TEAM_NAME_CANONICAL_MAP:
             return TEAM_NAME_CANONICAL_MAP[tid_str]
 
-    if fallback_name is not None and not pd.isna(fallback_name):
-        fallback = str(fallback_name).strip()
+    if fallback_name is not None:
+        try:
+            if not pd.isna(fallback_name):
+                fallback = str(fallback_name).strip()
 
-        if fallback:
-            fallback_key = fallback.upper()
-            fallback_tid = canonical_team_id(fallback_key)
+                if fallback:
+                    fallback_tid = canonical_team_id(fallback)
 
-            if fallback_tid is not pd.NA and not pd.isna(fallback_tid):
-                fallback_tid_str = str(fallback_tid)
+                    if fallback_tid is not pd.NA and str(fallback_tid) in TEAM_NAME_CANONICAL_MAP:
+                        return TEAM_NAME_CANONICAL_MAP[str(fallback_tid)]
 
-                if fallback_tid_str in TEAM_NAME_CANONICAL_MAP:
-                    return TEAM_NAME_CANONICAL_MAP[fallback_tid_str]
+                    return fallback
+        except Exception:
+            fallback = str(fallback_name).strip()
 
-            return fallback
+            if fallback:
+                return fallback
+
+    return pd.NA
+
+
+def resolve_team_name_raw(team_id_raw: Any, candidate_name: Any = None) -> Any:
+    try:
+        team_missing = pd.isna(team_id_raw)
+    except Exception:
+        team_missing = team_id_raw is None
+
+    try:
+        name_missing = pd.isna(candidate_name)
+    except Exception:
+        name_missing = candidate_name is None
+
+    if team_missing and name_missing:
+        return pd.NA
+
+    raw_id = None if team_missing else str(team_id_raw).strip()
+    raw_name = None if name_missing else str(candidate_name).strip()
+
+    if raw_name and raw_id and raw_name != raw_id:
+        return raw_name
+
+    if raw_name and not raw_id:
+        return raw_name
+
+    if raw_id:
+        return TEAM_NAME_LOOKUP_RAW.get(raw_id, raw_id)
 
     return pd.NA
 
 
 # ============================================================
-# STRING / NAME HELPERS
+# GENERAL TEXT / NUMERIC HELPERS
 # ============================================================
 
 def clean_text(value: Any) -> Any:
-    if value is None or pd.isna(value):
+    if value is None:
         return pd.NA
+
+    try:
+        if pd.isna(value):
+            return pd.NA
+    except Exception:
+        pass
 
     text = str(value)
     text = re.sub(r"\s+", " ", text).strip()
@@ -371,41 +501,6 @@ def clean_text(value: Any) -> Any:
         return pd.NA
 
     return text
-
-
-def normalize_person_name(value: Any) -> Any:
-    if value is None or pd.isna(value):
-        return pd.NA
-
-    text = str(value).strip()
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"[^\w\s\-\.'’]", "", text, flags=re.UNICODE)
-    text = text.replace("’", "'").strip()
-
-    suffix_pattern = r"\b(JR|SR|II|III|IV|V)\.?\b$"
-    text = re.sub(suffix_pattern, "", text, flags=re.IGNORECASE).strip()
-    text = re.sub(r"\s+", " ", text)
-
-    if text == "":
-        return pd.NA
-
-    return text.title()
-
-
-def slugify(value: Any) -> str:
-    if value is None or pd.isna(value):
-        return ""
-
-    text = str(value).strip().lower()
-    text = re.sub(r"[^a-z0-9]+", "-", text)
-    text = re.sub(r"-+", "-", text).strip("-")
-
-    return text
-
-
-def stable_hash(value: Any, n: int = 12) -> str:
-    text = json.dumps(value, sort_keys=True, default=str)
-    return hashlib.md5(text.encode("utf-8")).hexdigest()[:n]
 
 
 def safe_str(value: Any, default: str = "") -> str:
@@ -421,32 +516,61 @@ def safe_str(value: Any, default: str = "") -> str:
     return str(value)
 
 
-# ============================================================
-# NUMERIC HELPERS
-# ============================================================
+def slugify(value: Any) -> str:
+    if value is None:
+        return ""
 
-def safe_numeric(series_or_value: Any) -> Any:
-    return pd.to_numeric(series_or_value, errors="coerce")
-
-
-def safe_nullable_int(series_or_value: Any) -> Any:
     try:
-        return pd.to_numeric(series_or_value, errors="coerce").astype("Int64")
+        if pd.isna(value):
+            return ""
     except Exception:
-        return series_or_value
+        pass
+
+    text = str(value).strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    text = re.sub(r"-+", "-", text).strip("-")
+
+    return text
 
 
-def safe_divide(numerator: Any, denominator: Any) -> Any:
-    num = pd.to_numeric(numerator, errors="coerce")
-    den = pd.to_numeric(denominator, errors="coerce")
+def stable_hash(value: Any, n: int = 12) -> str:
+    text = json.dumps(value, sort_keys=True, default=str)
+    return hashlib.md5(text.encode("utf-8")).hexdigest()[:n]
 
-    if isinstance(num, pd.Series) or isinstance(den, pd.Series):
-        return num / den.replace(0, np.nan)
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def snake_case(value: Any) -> str:
+    text = str(value)
+    text = re.sub(r"[%/\-]+", "_", text)
+    text = re.sub(r"[^0-9A-Za-z]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_").lower()
+
+    return text
+
+
+def normalize_person_name(value: Any) -> Any:
+    if value is None:
+        return None
 
     try:
-        if pd.isna(den) or float(den) == 0:
-            return np.nan
-        return num / den
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    text = str(value).strip().lower()
+    text = re.sub(r"[^a-z0-9 ]+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text if text else None
+
+
+def to_num_scalar(value: Any) -> Any:
+    try:
+        return pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
     except Exception:
         return np.nan
 
@@ -464,12 +588,10 @@ def parse_number(value: Any) -> Any:
     if isinstance(value, (int, float, np.integer, np.floating)):
         return value
 
-    text = str(value).strip()
+    text = str(value).strip().replace(",", "")
 
-    if text == "":
+    if not text:
         return np.nan
-
-    text = text.replace(",", "")
 
     if text.endswith("%"):
         try:
@@ -485,45 +607,115 @@ def parse_number(value: Any) -> Any:
         return np.nan
 
 
+def safe_numeric(series_or_value: Any) -> Any:
+    return pd.to_numeric(series_or_value, errors="coerce")
+
+
+def coerce_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    out = df.copy()
+
+    for col in cols:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    return out
+
+
+def safe_nullable_int(series: Any) -> Any:
+    s = pd.to_numeric(series, errors="coerce")
+    non_null = s.dropna()
+
+    if non_null.empty:
+        return s.astype("Int64")
+
+    try:
+        if np.isclose(non_null % 1, 0).all():
+            return s.round().astype("Int64")
+    except Exception:
+        pass
+
+    return s
+
+
+def safe_divide(numerator: Any, denominator: Any) -> Any:
+    num = pd.to_numeric(numerator, errors="coerce")
+    den = pd.to_numeric(denominator, errors="coerce")
+
+    if isinstance(num, pd.Series) or isinstance(den, pd.Series):
+        return num / den.replace(0, np.nan)
+
+    try:
+        if pd.isna(den) or float(den) == 0:
+            return np.nan
+
+        return num / den
+    except Exception:
+        return np.nan
+
+
 # ============================================================
 # JSON / FILE HELPERS
 # ============================================================
 
 def ensure_parent(path: Path) -> Path:
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+
     return path
 
 
-def read_json_gz(path: Path) -> Any:
+def write_gzip_json(path: Any, obj: Any) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with gzip.open(path, "wt", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, default=str)
+
+
+def read_gzip_json(path: Any) -> Any:
     with gzip.open(path, "rt", encoding="utf-8") as f:
         return json.load(f)
 
 
-def write_json_gz(path: Path, obj: Any) -> None:
-    ensure_parent(path)
-
-    with gzip.open(path, "wt", encoding="utf-8") as f:
-        json.dump(obj, f, default=str)
+def write_json_gz(path: Any, obj: Any) -> None:
+    write_gzip_json(path, obj)
 
 
-def load_json_gz(path: Path) -> Any:
-    return read_json_gz(path)
+def read_json_gz(path: Any) -> Any:
+    return read_gzip_json(path)
 
 
-def save_json_gz(path: Path, obj: Any) -> None:
-    write_json_gz(path, obj)
+def save_json_gz(path: Any, obj: Any) -> None:
+    write_gzip_json(path, obj)
 
 
-def read_json_file(path: Path) -> Any:
+def load_json_gz(path: Any) -> Any:
+    return read_gzip_json(path)
+
+
+def write_json_file(path: Any, obj: Any) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, default=str)
+
+
+def read_json_file(path: Any) -> Any:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def write_json_file(path: Path, obj: Any) -> None:
-    ensure_parent(path)
+def safe_get(d: Any, *keys: Any, default: Any = None) -> Any:
+    cur = d
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, default=str)
+    for key in keys:
+        if isinstance(cur, dict) and key in cur:
+            cur = cur[key]
+        else:
+            return default
+
+    return cur
 
 
 def as_list(value: Any) -> list[Any]:
@@ -569,11 +761,11 @@ def deep_find_key(obj: Any, target_key: str) -> list[Any]:
     found: list[Any] = []
 
     if isinstance(obj, dict):
-        for k, v in obj.items():
-            if str(k) == target_key:
-                found.append(v)
+        for key, value in obj.items():
+            if str(key) == target_key:
+                found.append(value)
 
-            found.extend(deep_find_key(v, target_key))
+            found.extend(deep_find_key(value, target_key))
 
     elif isinstance(obj, list):
         for item in obj:
@@ -602,22 +794,96 @@ def flatten_json(obj: Any, parent_key: str = "", sep: str = "_") -> dict[str, An
     items: dict[str, Any] = {}
 
     if isinstance(obj, dict):
-        for k, v in obj.items():
-            new_key = f"{parent_key}{sep}{k}" if parent_key else str(k)
+        for key, value in obj.items():
+            new_key = f"{parent_key}{sep}{key}" if parent_key else str(key)
 
-            if isinstance(v, dict):
-                items.update(flatten_json(v, new_key, sep=sep))
-            elif isinstance(v, list):
-                items[new_key] = json.dumps(v, default=str)
+            if isinstance(value, dict):
+                items.update(flatten_json(value, new_key, sep=sep))
+            elif isinstance(value, list):
+                items[new_key] = json.dumps(value, default=str)
             else:
-                items[new_key] = v
+                items[new_key] = value
 
     return items
 
 
 # ============================================================
-# API REQUEST HELPERS
+# HTTP / API HELPERS
 # ============================================================
+
+def fetch_url(
+    url: str,
+    session: Optional[requests.Session] = None,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
+    max_retries: int = MAX_RETRIES,
+) -> requests.Response:
+    if session is None:
+        session = SESSION
+
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            if REQUEST_SLEEP_SECONDS:
+                time.sleep(REQUEST_SLEEP_SECONDS)
+
+            response = session.get(url, timeout=timeout)
+
+            if response.status_code in {429, 500, 502, 503, 504} and attempt < max_retries:
+                time.sleep(min(2 ** attempt, 10))
+                continue
+
+            return response
+
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+
+            if attempt < max_retries:
+                time.sleep(min(2 ** attempt, 10))
+                continue
+
+            raise
+
+    if last_exc is not None:
+        raise last_exc
+
+    raise RuntimeError(f"Unable to fetch URL after {max_retries} retries: {url}")
+
+
+def fetch_json_with_cache(
+    url: str,
+    cache_path: Any,
+    session: Optional[requests.Session] = None,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
+    force: bool = False,
+) -> tuple[Optional[Any], Optional[int], str]:
+    if session is None:
+        session = SESSION
+
+    cache_path = Path(cache_path)
+
+    if cache_path.exists() and not force:
+        try:
+            payload = read_gzip_json(cache_path)
+            return payload, 200, "cached"
+        except Exception:
+            try:
+                cache_path.unlink()
+            except Exception:
+                pass
+
+    response = fetch_url(url, session=session, timeout=timeout)
+
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+
+    if response.status_code == 200 and payload is not None:
+        write_gzip_json(cache_path, payload)
+
+    return payload, response.status_code, "downloaded"
+
 
 def api_get_json(
     url: str,
@@ -626,10 +892,6 @@ def api_get_json(
     max_retries: int = MAX_RETRIES,
     sleep_seconds: float = REQUEST_SLEEP_SECONDS,
 ) -> tuple[Optional[Any], dict[str, Any]]:
-    """
-    Performs a GET request and returns (json_payload, metadata).
-    """
-
     meta = {
         "url": url,
         "params": json.dumps(params or {}, sort_keys=True, default=str),
@@ -650,11 +912,6 @@ def api_get_json(
 
             meta["status_code"] = response.status_code
 
-            if response.status_code == 304:
-                meta["ok"] = True
-                meta["error"] = "not_modified"
-                return None, meta
-
             if response.status_code in {429, 500, 502, 503, 504} and attempt < max_retries:
                 time.sleep(min(2 ** attempt, 10))
                 continue
@@ -667,6 +924,7 @@ def api_get_json(
                 payload = json.loads(response.text)
 
             meta["ok"] = True
+
             return payload, meta
 
         except Exception as exc:
@@ -683,22 +941,290 @@ def api_get_json(
     return None, meta
 
 
-def get_json(
-    url: str,
-    params: Optional[dict[str, Any]] = None,
-) -> tuple[Optional[Any], dict[str, Any]]:
+def get_json(url: str, params: Optional[dict[str, Any]] = None) -> tuple[Optional[Any], dict[str, Any]]:
     return api_get_json(url, params=params)
 
 
-def request_json(
-    url: str,
-    params: Optional[dict[str, Any]] = None,
-) -> tuple[Optional[Any], dict[str, Any]]:
+def request_json(url: str, params: Optional[dict[str, Any]] = None) -> tuple[Optional[Any], dict[str, Any]]:
     return api_get_json(url, params=params)
 
 
 # ============================================================
-# AGGREGATION HELPERS
+# EVENT / SCHEDULE HELPERS
+# ============================================================
+
+def extract_game_number_from_slug(slug: Any) -> Any:
+    if slug is None:
+        return pd.NA
+
+    try:
+        if pd.isna(slug):
+            return pd.NA
+    except Exception:
+        pass
+
+    slug = str(slug)
+
+    m1 = re.search(r"_game_(\d+)$", slug)
+
+    if m1:
+        return int(m1.group(1))
+
+    m2 = re.search(r"^game-(\d+)-\d{4}-\d{2}-\d{2}$", slug)
+
+    if m2:
+        return int(m2.group(1))
+
+    m3 = re.search(r"^(\d{4})-ev-(\d+)$", slug)
+
+    if m3:
+        return int(m3.group(2))
+
+    m4 = re.search(r"(?:game|ev)[-_]?(\d+)", slug, flags=re.IGNORECASE)
+
+    if m4:
+        return int(m4.group(1))
+
+    return pd.NA
+
+
+def normalize_game_number(value: Any) -> Any:
+    if value is None:
+        return pd.NA
+
+    try:
+        if pd.isna(value):
+            return pd.NA
+    except Exception:
+        pass
+
+    match = re.search(r"(\d+)", str(value))
+
+    if not match:
+        return pd.NA
+
+    try:
+        return int(match.group(1))
+    except Exception:
+        return pd.NA
+
+
+def normalize_date_utc(value: Any) -> Any:
+    if value is None:
+        return pd.NA
+
+    try:
+        if pd.isna(value):
+            return pd.NA
+    except Exception:
+        pass
+
+    try:
+        parsed = pd.to_datetime(value, utc=True, errors="coerce")
+
+        if pd.isna(parsed):
+            return pd.NA
+
+        return parsed.date().isoformat()
+
+    except Exception:
+        return pd.NA
+
+
+def build_game_id(season: Any, slug_or_number: Any) -> str:
+    season_str = safe_str(season, "unknown")
+    slug = slugify(slug_or_number)
+
+    if not slug:
+        slug = stable_hash(slug_or_number)
+
+    return f"{season_str}_{slug}"
+
+
+def extract_home_team_obj(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+
+    return data.get("homeTeam", {}) or {}
+
+
+def extract_away_team_obj(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+
+    for key in ["visitorTeam", "awayTeam", "visitor", "away"]:
+        obj = data.get(key, {}) or {}
+
+        if obj:
+            return obj
+
+    return {}
+
+
+def extract_team_id_from_obj(obj: Any) -> Any:
+    if not isinstance(obj, dict):
+        return pd.NA
+
+    return obj.get("officialId") or obj.get("teamId") or obj.get("id")
+
+
+def extract_team_name_from_obj(obj: Any) -> Any:
+    if not isinstance(obj, dict):
+        return pd.NA
+
+    return (
+        obj.get("name")
+        or obj.get("fullName")
+        or obj.get("teamName")
+        or obj.get("nickname")
+        or obj.get("officialId")
+        or obj.get("teamId")
+        or obj.get("id")
+    )
+
+
+def validate_event_payload(payload: Any, season: Any) -> dict[str, Any]:
+    data = safe_get(payload, "data", default={}) if payload else {}
+
+    if not isinstance(data, dict):
+        data = {}
+
+    year_val = to_num_scalar(data.get("year"))
+    event_id = data.get("eventId")
+    event_numeric_id = data.get("id")
+    season_segment = data.get("seasonSegment")
+    slugname = data.get("slugname")
+    start_time_unix = to_num_scalar(data.get("startTime"))
+    event_status = data.get("eventStatus")
+
+    valid = bool(
+        not pd.isna(year_val)
+        and int(year_val) == int(season)
+        and event_id
+        and season_segment == COMPETITION_TYPE
+    )
+
+    return {
+        "valid": valid,
+        "year": None if pd.isna(year_val) else int(year_val),
+        "event_id": event_id,
+        "event_numeric_id": event_numeric_id,
+        "competition_type": season_segment,
+        "slugname": slugname,
+        "start_time_unix": None if pd.isna(start_time_unix) else int(start_time_unix),
+        "event_status": event_status,
+    }
+
+
+# ============================================================
+# NESTED STAT EXTRACTION HELPERS
+# ============================================================
+
+def recursive_leaf_pairs(obj: Any, prefix: str = "") -> list[tuple[str, Any]]:
+    pairs: list[tuple[str, Any]] = []
+
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            p = f"{prefix}.{key}" if prefix else str(key)
+            pairs.extend(recursive_leaf_pairs(value, p))
+
+    elif isinstance(obj, list):
+        for i, value in enumerate(obj):
+            p = f"{prefix}[{i}]"
+            pairs.extend(recursive_leaf_pairs(value, p))
+
+    else:
+        pairs.append((prefix, obj))
+
+    return pairs
+
+
+def find_numeric_leaf_candidates(obj: Any, normalized_terms: list[str]) -> list[tuple[str, Any]]:
+    pairs = recursive_leaf_pairs(obj)
+    out: list[tuple[str, Any]] = []
+
+    for raw_path, value in pairs:
+        path_norm = snake_case(raw_path)
+
+        if all(term in path_norm for term in normalized_terms):
+            num = to_num_scalar(value)
+
+            if not pd.isna(num):
+                out.append((raw_path, num))
+
+    return out
+
+
+def coalesce_numeric_with_alt(
+    item: dict[str, Any],
+    direct_keys: list[str],
+    alt_term_groups: list[list[str]],
+    allow_zero: bool = True,
+) -> Any:
+    if not isinstance(item, dict):
+        return np.nan
+
+    for key in direct_keys:
+        if key in item:
+            value = to_num_scalar(item.get(key))
+
+            if not pd.isna(value):
+                if allow_zero or value != 0:
+                    return value
+
+    for term_group in alt_term_groups:
+        candidates = find_numeric_leaf_candidates(item, term_group)
+
+        if candidates:
+            candidates_sorted = sorted(candidates, key=lambda x: (x[1] == 0, len(x[0])))
+            best_value = candidates_sorted[0][1]
+
+            if allow_zero or best_value != 0:
+                return best_value
+
+    return np.nan
+
+
+def derive_one_point_goals(total_goals: Any, raw_one_point_goals: Any, two_point_goals: Any) -> Any:
+    total = to_num_scalar(total_goals)
+    raw_one = to_num_scalar(raw_one_point_goals)
+    two = to_num_scalar(two_point_goals)
+
+    if not pd.isna(total) and not pd.isna(two):
+        calc = total - two
+
+        if pd.isna(raw_one) or not np.isclose(raw_one, calc):
+            return calc
+
+    return raw_one
+
+
+def derive_scoring_points(one_point_goals: Any, two_point_goals: Any) -> Any:
+    one = to_num_scalar(one_point_goals)
+    two = to_num_scalar(two_point_goals)
+
+    if pd.isna(one) and pd.isna(two):
+        return np.nan
+
+    return (0 if pd.isna(one) else one) + 2 * (0 if pd.isna(two) else two)
+
+
+def derive_player_points(raw_points: Any, scoring_points: Any, assists: Any) -> Any:
+    raw = to_num_scalar(raw_points)
+    scoring = to_num_scalar(scoring_points)
+    ast = to_num_scalar(assists)
+
+    if not pd.isna(scoring) and not pd.isna(ast):
+        calc = scoring + ast
+
+        if pd.isna(raw) or not np.isclose(raw, calc):
+            return calc
+
+    return raw
+
+
+# ============================================================
+# AGGREGATION / RATE HELPERS
 # ============================================================
 
 def mode_or_first(series: pd.Series) -> Any:
@@ -719,17 +1245,18 @@ def latest_non_null_by_game(df: pd.DataFrame, col: str) -> Any:
     if df is None or len(df) == 0 or col not in df.columns:
         return pd.NA
 
-    s = df[col].dropna()
+    sort_cols = [c for c in ["season", "game_number", "game_id"] if c in df.columns]
+
+    if sort_cols:
+        s = df.sort_values(sort_cols)[col].dropna()
+    else:
+        s = df[col].dropna()
 
     if len(s) == 0:
         return pd.NA
 
     return s.iloc[-1]
 
-
-# ============================================================
-# RATE / DERIVED STAT HELPERS
-# ============================================================
 
 PLAYER_RATE_TOTALS = [
     "points",
@@ -778,6 +1305,7 @@ TEAM_RATE_TOTALS = [
     "total_clears",
     "failed_clears",
     "clear_attempts",
+    "clears",
     "touches",
     "total_passes",
     "time_in_possession",
@@ -792,6 +1320,18 @@ TEAM_RATE_TOTALS = [
     "total_passes_against",
     "offensive_sequence_proxy_against",
 ]
+
+
+def seconds_to_mmss_safe(value: Any) -> Any:
+    try:
+        seconds = int(round(float(value)))
+    except Exception:
+        return pd.NA
+
+    if seconds < 0:
+        return pd.NA
+
+    return f"{seconds // 60}:{seconds % 60:02d}"
 
 
 def add_per_game_columns(
@@ -818,7 +1358,6 @@ def add_standard_player_rates(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     out = df.copy()
-
     out = add_per_game_columns(out, PLAYER_RATE_TOTALS, "games")
 
     if "shots" in out.columns and "goals" in out.columns:
@@ -866,7 +1405,6 @@ def add_standard_team_rates(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     out = df.copy()
-
     out = add_per_game_columns(out, TEAM_RATE_TOTALS, "games")
 
     if "shots" in out.columns and "goals" in out.columns:
@@ -893,6 +1431,9 @@ def add_standard_team_rates(df: pd.DataFrame) -> pd.DataFrame:
     if "total_clears" in out.columns and "clear_attempts" in out.columns:
         out["clear_pct_calc"] = safe_divide(out["total_clears"], out["clear_attempts"])
         out["clear_pct"] = out["clear_pct_calc"]
+    elif "clears" in out.columns and "clear_attempts" in out.columns:
+        out["clear_pct_calc"] = safe_divide(out["clears"], out["clear_attempts"])
+        out["clear_pct"] = out["clear_pct_calc"]
 
     if "saves" in out.columns:
         saves = pd.to_numeric(out["saves"], errors="coerce")
@@ -917,27 +1458,7 @@ def add_standard_team_rates(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def seconds_to_mmss_safe(value: Any) -> Any:
-    try:
-        seconds = int(round(float(value)))
-    except Exception:
-        return pd.NA
-
-    if seconds < 0:
-        return pd.NA
-
-    return f"{seconds // 60}:{seconds % 60:02d}"
-
-
 def fill_team_opponent_stats_from_pair(team_game_stats: pd.DataFrame) -> pd.DataFrame:
-    """
-    For each two-row game/team table, fills *_against fields from the opponent row
-    when those fields are absent or blank.
-
-    This is important because final records, defensive marts, matchup review,
-    and team style profiles should be based on final scores and real opponent stats.
-    """
-
     if team_game_stats is None or len(team_game_stats) == 0:
         return pd.DataFrame()
 
@@ -968,6 +1489,7 @@ def fill_team_opponent_stats_from_pair(team_game_stats: pd.DataFrame) -> pd.Data
         "total_clears",
         "failed_clears",
         "clear_attempts",
+        "clears",
         "touches",
         "total_passes",
         "time_in_possession",
@@ -1020,10 +1542,6 @@ def fill_team_opponent_stats_from_pair(team_game_stats: pd.DataFrame) -> pd.Data
 # ============================================================
 
 def make_unique_storage_columns(columns: list[Any]) -> list[str]:
-    """
-    Ensures all output column names are strings and unique before writing CSV/parquet.
-    """
-
     seen: dict[str, int] = {}
     clean_cols: list[str] = []
 
@@ -1040,16 +1558,7 @@ def make_unique_storage_columns(columns: list[Any]) -> list[str]:
     return clean_cols
 
 
-def sanitize_dataframe_for_storage(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Converts a DataFrame into a parquet-safe and DuckDB-safe shape.
-
-    Main protections:
-    - pyarrow cannot write columns with mixed Python types, such as ints and strings.
-    - QC tables often mix values like 0, '>0 rows', and 'file_exists' in one column.
-    - Empty compatibility tables need at least one placeholder column for clean DuckDB load.
-    """
-
+def sanitize_dataframe_for_storage(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     if df is None:
         return pd.DataFrame({"_empty_placeholder": pd.Series(dtype="string")})
 
@@ -1139,13 +1648,6 @@ def write_table_artifacts(
     df: pd.DataFrame,
     artifact_rows: list[dict[str, Any]],
 ) -> None:
-    """
-    Writes one table to curated CSV + parquet artifacts.
-
-    This version is intentionally defensive because production builds can create
-    mixed-type QC columns and empty compatibility tables.
-    """
-
     CURATED_ALL_DIR.mkdir(parents=True, exist_ok=True)
 
     df_safe = sanitize_dataframe_for_storage(df)
@@ -1198,10 +1700,11 @@ def standardize_column_names(df: pd.DataFrame) -> pd.DataFrame:
 
     out = df.copy()
 
-    def clean_col(c: Any) -> str:
-        text = str(c).strip()
+    def clean_col(col: Any) -> str:
+        text = str(col).strip()
         text = re.sub(r"[^A-Za-z0-9]+", "_", text)
         text = re.sub(r"_+", "_", text).strip("_").lower()
+
         return text
 
     out.columns = make_unique_storage_columns([clean_col(c) for c in out.columns])
@@ -1222,79 +1725,24 @@ def coalesce_columns(df: pd.DataFrame, output_col: str, candidates: list[str]) -
     if output_col not in out.columns:
         out[output_col] = pd.NA
 
-    for c in candidates:
-        if c in out.columns:
-            out[output_col] = out[output_col].where(out[output_col].notna(), out[c])
+    for col in candidates:
+        if col in out.columns:
+            out[output_col] = out[output_col].where(out[output_col].notna(), out[col])
 
     return out
 
 
 def first_existing_col(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
-    for c in candidates:
-        if c in df.columns:
-            return c
+    for col in candidates:
+        if col in df.columns:
+            return col
 
     return None
 
 
 # ============================================================
-# GAME / ID HELPERS
-# ============================================================
-
-def build_game_id(season: Any, slug_or_number: Any) -> str:
-    season_str = safe_str(season, "unknown")
-    slug = slugify(slug_or_number)
-
-    if not slug:
-        slug = stable_hash(slug_or_number)
-
-    return f"{season_str}_{slug}"
-
-
-def normalize_game_number(value: Any) -> Any:
-    if value is None:
-        return pd.NA
-
-    try:
-        if pd.isna(value):
-            return pd.NA
-    except Exception:
-        pass
-
-    text = str(value)
-
-    match = re.search(r"(\d+)", text)
-
-    if not match:
-        return pd.NA
-
-    try:
-        return int(match.group(1))
-    except Exception:
-        return pd.NA
-
-
-def normalize_date_utc(value: Any) -> Any:
-    if value is None:
-        return pd.NA
-
-    try:
-        if pd.isna(value):
-            return pd.NA
-    except Exception:
-        pass
-
-    try:
-        return pd.to_datetime(value, utc=True, errors="coerce").date().isoformat()
-    except Exception:
-        return pd.NA
-
-
-# ============================================================
 # SECTION 2A COMPLETE
 # ============================================================
-
-print_startup_summary()
 
 # ============================================================
 # SECTION 2B — GAME DISCOVERY AND SCHEDULE COLLECTION
