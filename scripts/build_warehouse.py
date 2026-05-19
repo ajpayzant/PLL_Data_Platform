@@ -1,996 +1,178 @@
-# ============================================================
 # PLL DATA PLATFORM — WAREHOUSE BUILDER
-# SECTION 2A — IMPORTS, CONFIG, PATHS, API SESSION, HELPERS
 # ============================================================
-#
-# This script is the GitHub/production version of the Colab
-# database builder. It is designed to run from:
-#
-#   python scripts/build_warehouse.py
-#
-# Required environment variable:
-#
-#   PLL_BEARER_TOKEN
-#
-# Optional environment variables:
-#
-#   PLL_PROJECT_ROOT=data
-#   PLL_TARGET_SEASONS=2022,2023,2024,2025,2026
-#   PLL_FORCE_RECOLLECT=0
-#   PLL_FORCE_REDISCOVER=0
-#
+# SECTION 2A — IMPORTS, CONFIG, PATHS, CONSTANTS, AND SHARED HELPERS
 # ============================================================
 
 from __future__ import annotations
 
 import os
 import re
+import sys
 import json
 import gzip
 import time
+import math
+import shutil
 import hashlib
-import datetime as dt
 from pathlib import Path
+from datetime import datetime, timezone, date
 from typing import Any, Optional
 
 import duckdb
 import numpy as np
 import pandas as pd
 import requests
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-)
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 
 # ============================================================
-# GLOBAL PANDAS OPTIONS
+# PANDAS / DISPLAY CONFIG
 # ============================================================
 
-pd.set_option("display.max_columns", 250)
-pd.set_option("display.width", 250)
-pd.set_option("display.max_colwidth", 250)
-
-
-# ============================================================
-# ENVIRONMENT / CONFIG HELPERS
-# ============================================================
-
-def env_bool(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name, "")
-    if raw is None or str(raw).strip() == "":
-        return default
-    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def env_list_int(name: str, default: list[int]) -> list[int]:
-    raw = os.environ.get(name, "")
-    if raw is None or str(raw).strip() == "":
-        return default
-
-    out: list[int] = []
-
-    for part in str(raw).split(","):
-        part = part.strip()
-        if not part:
-            continue
-        out.append(int(part))
-
-    return out if out else default
-
-
-def clean_token_value(x: Any) -> str:
-    if x is None:
-        return ""
-
-    x = str(x).strip()
-    x = x.replace("^", "").strip()
-    x = re.sub(r"\s+", " ", x).strip()
-
-    return x
-
-
-def token_preview(tok: str) -> str:
-    if not tok:
-        return "MISSING"
-
-    if len(tok) <= 24:
-        return tok[:6] + "..."
-
-    return f"{tok[:14]}...{tok[-6:]}"
-
-
-def now_utc_iso() -> str:
-    return (
-        dt.datetime.now(dt.timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-
-
-def utc_run_id() -> str:
-    return dt.datetime.now(dt.timezone.utc).strftime("run_%Y%m%d_%H%M%S")
+pd.set_option("display.max_columns", 500)
+pd.set_option("display.width", 240)
 
 
 # ============================================================
-# PROJECT PATHS
+# REPOSITORY / DATA PATHS
 # ============================================================
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-
-PROJECT_ROOT = Path(os.environ.get("PLL_PROJECT_ROOT", "data"))
-
-if not PROJECT_ROOT.is_absolute():
-    PROJECT_ROOT = REPO_ROOT / PROJECT_ROOT
+PROJECT_ROOT = REPO_ROOT / "data"
 
 SOURCE_DATA_DIR = PROJECT_ROOT / "source_data"
-API_RESPONSES_DIR = SOURCE_DATA_DIR / "api_responses"
+SOURCE_DIR = SOURCE_DATA_DIR
 
-STANDARDIZED_DATA_DIR = PROJECT_ROOT / "standardized_data"
-GAME_TABLES_DIR = STANDARDIZED_DATA_DIR / "game_tables"
-REFERENCE_TABLES_DIR = STANDARDIZED_DATA_DIR / "reference_tables"
+API_RESPONSES_DIR = SOURCE_DATA_DIR / "api_responses"
+REFERENCE_DOWNLOADS_DIR = SOURCE_DATA_DIR / "reference_downloads"
 
 CURATED_DATA_DIR = PROJECT_ROOT / "curated_data"
 CURATED_ALL_DIR = CURATED_DATA_DIR / "all_requested_seasons"
 
 ANALYTICS_DATABASE_DIR = PROJECT_ROOT / "analytics_database"
-QUALITY_CHECKS_DIR = PROJECT_ROOT / "quality_checks"
-CONFIG_DIR = PROJECT_ROOT / "config"
-EXPORT_DIR = PROJECT_ROOT / "exports"
-
-RUN_ID = utc_run_id()
-RUN_CHECK_DIR = QUALITY_CHECKS_DIR / RUN_ID
-
 DB_PATH = ANALYTICS_DATABASE_DIR / "pll_warehouse.duckdb"
 
-MANUAL_SLUG_INVENTORY_FILE = CONFIG_DIR / "manual_slug_inventory.csv"
+QUALITY_CHECKS_DIR = PROJECT_ROOT / "quality_checks"
+RUN_ID = datetime.now(timezone.utc).strftime("run_%Y%m%d_%H%M%S")
+RUN_CHECK_DIR = QUALITY_CHECKS_DIR / RUN_ID
 
-for p in [
+for path in [
     PROJECT_ROOT,
     SOURCE_DATA_DIR,
     API_RESPONSES_DIR,
-    STANDARDIZED_DATA_DIR,
-    GAME_TABLES_DIR,
-    REFERENCE_TABLES_DIR,
+    REFERENCE_DOWNLOADS_DIR,
     CURATED_DATA_DIR,
     CURATED_ALL_DIR,
     ANALYTICS_DATABASE_DIR,
     QUALITY_CHECKS_DIR,
     RUN_CHECK_DIR,
-    CONFIG_DIR,
-    EXPORT_DIR,
 ]:
-    p.mkdir(parents=True, exist_ok=True)
+    path.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
-# MAIN CONFIG
+# ENVIRONMENT / RUN SETTINGS
 # ============================================================
 
-TARGET_SEASONS = env_list_int(
-    "PLL_TARGET_SEASONS",
-    [2022, 2023, 2024, 2025, 2026],
-)
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
 
-COMPETITION_TYPE = os.environ.get("PLL_COMPETITION_TYPE", "regular").strip() or "regular"
+    if raw is None:
+        return default
 
-EXPECTED_REGULAR_GAMES: dict[int, Optional[int]] = {
-    2022: 40,
-    2023: 40,
-    2024: 40,
-    2025: 40,
-    2026: None,  # ongoing / schedule-aware
-}
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-PLL_STATS_SITE = "https://stats.premierlacrosseleague.com"
-PLL_API_BASE = "https://api.stats.premierlacrosseleague.com/api/v4"
-TIME_ZONE = os.environ.get("PLL_TIME_ZONE", "America/Los_Angeles").strip() or "America/Los_Angeles"
+
+def env_int_list(name: str, default: list[int]) -> list[int]:
+    raw = os.getenv(name)
+
+    if raw is None or str(raw).strip() == "":
+        return default
+
+    values: list[int] = []
+
+    for part in str(raw).split(","):
+        part = part.strip()
+
+        if not part:
+            continue
+
+        try:
+            values.append(int(part))
+        except Exception:
+            pass
+
+    return values if values else default
+
+
+TARGET_SEASONS = env_int_list("PLL_TARGET_SEASONS", [2022, 2023, 2024, 2025, 2026])
+COMPETITION_TYPE = os.getenv("PLL_COMPETITION_TYPE", "regular").strip().lower()
 
 FORCE_RECOLLECT = env_bool("PLL_FORCE_RECOLLECT", False)
 FORCE_REDISCOVER = env_bool("PLL_FORCE_REDISCOVER", False)
 
-PLL_BEARER_TOKEN = clean_token_value(os.environ.get("PLL_BEARER_TOKEN", ""))
+REQUEST_SLEEP_SECONDS = float(os.getenv("PLL_REQUEST_SLEEP_SECONDS", "0.10"))
+REQUEST_TIMEOUT_SECONDS = int(os.getenv("PLL_REQUEST_TIMEOUT_SECONDS", "30"))
+MAX_RETRIES = int(os.getenv("PLL_MAX_RETRIES", "3"))
+
+PLL_API_BASE_URL = os.getenv(
+    "PLL_API_BASE_URL",
+    "https://stats.premierlacrosseleague.com",
+).rstrip("/")
 
 
 # ============================================================
-# TEAM MAPPINGS
+# TOKEN / REQUEST SESSION
 # ============================================================
 
-TEAM_ID_CANONICAL_MAP = {
-    "ATL": "ATL",
-    "OUT": "OUT",
-    "CAN": "CAN",
-    "RED": "RED",
-    "WAT": "WAT",
-    "WHP": "WHP",
-    "CHA": "CHA",
-    "ARC": "ARC",
-    "CHR": "OUT",   # Chrome historical franchise rolls into Outlaws
-}
-
-TEAM_NAME_CANONICAL_MAP = {
-    "ATL": "Atlas",
-    "OUT": "Outlaws",
-    "CAN": "Cannons",
-    "RED": "Redwoods",
-    "WAT": "Waterdogs",
-    "WHP": "Whipsnakes",
-    "CHA": "Chaos",
-    "ARC": "Archers",
-    "CHR": "Outlaws",
-}
-
-TEAM_NAME_LOOKUP_RAW = {
-    "ATL": "Atlas",
-    "OUT": "Outlaws",
-    "CAN": "Cannons",
-    "RED": "Redwoods",
-    "WAT": "Waterdogs",
-    "WHP": "Whipsnakes",
-    "CHA": "Chaos",
-    "ARC": "Archers",
-    "CHR": "Chrome",
-}
-
-TEAM_DISPLAY_NAME_LOOKUP = {
-    "ATL": "New York Atlas",
-    "OUT": "Denver Outlaws",
-    "CAN": "Boston Cannons",
-    "RED": "California Redwoods",
-    "WAT": "Philadelphia Waterdogs",
-    "WHP": "Maryland Whipsnakes",
-    "CHA": "Carolina Chaos",
-    "ARC": "Utah Archers",
-}
-
-
-def canonical_team_id(team_id: Any) -> Any:
-    if pd.isna(team_id):
-        return pd.NA
-
-    team_id_str = str(team_id).strip()
-    return TEAM_ID_CANONICAL_MAP.get(team_id_str, team_id_str)
-
-
-def canonical_team_name(team_id_raw: Any, fallback_name: Any = None) -> Any:
-    if pd.isna(team_id_raw):
-        return fallback_name if fallback_name is not None else pd.NA
-
-    team_id_raw = str(team_id_raw).strip()
-
-    return TEAM_NAME_CANONICAL_MAP.get(
-        team_id_raw,
-        fallback_name if fallback_name is not None else team_id_raw,
-    )
-
-
-def resolve_team_name_raw(team_id_raw: Any, candidate_name: Any = None) -> Any:
-    if pd.isna(team_id_raw) and pd.isna(candidate_name):
-        return pd.NA
-
-    raw_id = None if pd.isna(team_id_raw) else str(team_id_raw).strip()
-    raw_name = None if pd.isna(candidate_name) else str(candidate_name).strip()
-
-    if raw_name and raw_id and raw_name != raw_id:
-        return raw_name
-
-    if raw_name and not raw_id:
-        return raw_name
-
-    if raw_id:
-        return TEAM_NAME_LOOKUP_RAW.get(raw_id, raw_id)
-
-    return pd.NA
-
-
-# ============================================================
-# HTTP SESSION
-# ============================================================
-
-def build_session(bearer_token: str = "") -> requests.Session:
-    session = requests.Session()
-
-    headers = {
-        "accept": "*/*",
-        "accept-language": "en-US,en;q=0.9",
-        "cache-control": "no-cache",
-        "content-type": "application/json",
-        "origin": PLL_STATS_SITE,
-        "pragma": "no-cache",
-        "referer": f"{PLL_STATS_SITE}/",
-        "time-zone": TIME_ZONE,
-        "user-agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/146.0.0.0 Safari/537.36"
-        ),
-    }
-
-    if bearer_token:
-        tok = clean_token_value(bearer_token)
-        headers["authorization"] = tok if tok.lower().startswith("bearer ") else f"Bearer {tok}"
-        headers["authsource"] = "stats"
-
-    session.headers.update(headers)
-
-    return session
-
-
-SESSION = build_session(PLL_BEARER_TOKEN)
-
-
-# ============================================================
-# URL BUILDERS
-# ============================================================
-
-def event_list_url(year: int, season_segment: str = COMPETITION_TYPE) -> str:
-    return f"{PLL_API_BASE}/events?year={year}&seasonSegment={season_segment}"
-
-
-def event_summary_url(slug: str) -> str:
-    return f"{PLL_API_BASE}/events/{slug}"
-
-
-def player_game_stats_url(slug: str) -> str:
-    return f"{PLL_API_BASE}/events/{slug}/players/stats"
-
-
-def team_game_stats_url(slug: str) -> str:
-    return f"{PLL_API_BASE}/events/{slug}/teams/stats"
-
-
-# ============================================================
-# FILE / JSON HELPERS
-# ============================================================
-
-def sha256_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
-
-
-def write_gzip_json(path: Path | str, obj: Any) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    with gzip.open(path, "wt", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False)
-
-
-def read_gzip_json(path: Path | str) -> Any:
-    with gzip.open(path, "rt", encoding="utf-8") as f:
-        return json.load(f)
-
-
-@retry(
-    retry=retry_if_exception_type((requests.exceptions.RequestException,)),
-    wait=wait_exponential(multiplier=1, min=1, max=10),
-    stop=stop_after_attempt(4),
-    reraise=True,
-)
-def fetch_url(
-    url: str,
-    session: Optional[requests.Session] = None,
-    timeout: int = 30,
-) -> requests.Response:
-    if session is None:
-        session = SESSION
-
-    return session.get(url, timeout=timeout)
-
-
-def fetch_json_with_cache(
-    url: str,
-    cache_path: Path | str,
-    session: Optional[requests.Session] = None,
-    timeout: int = 30,
-    force: bool = False,
-) -> tuple[Any, Optional[int], str]:
-    if session is None:
-        session = SESSION
-
-    cache_path = Path(cache_path)
-
-    if cache_path.exists() and not force:
-        try:
-            payload = read_gzip_json(cache_path)
-            return payload, 200, "cached"
-        except Exception:
-            try:
-                cache_path.unlink()
-            except Exception:
-                pass
-
-    response = fetch_url(url, session=session, timeout=timeout)
-
-    try:
-        payload = response.json()
-    except Exception:
-        payload = None
-
-    if response.status_code == 200 and payload is not None:
-        write_gzip_json(cache_path, payload)
-
-    return payload, response.status_code, "downloaded"
-
-
-# ============================================================
-# GENERAL DATA HELPERS
-# ============================================================
-
-def safe_get(d: Any, *keys: str, default: Any = None) -> Any:
-    cur = d
-
-    for k in keys:
-        if isinstance(cur, dict) and k in cur:
-            cur = cur[k]
-        else:
-            return default
-
-    return cur
-
-
-def snake_case(s: Any) -> str:
-    s = str(s)
-    s = re.sub(r"[%/\-]+", "_", s)
-    s = re.sub(r"[^0-9A-Za-z]+", "_", s)
-    s = re.sub(r"_+", "_", s).strip("_").lower()
-    return s
-
-
-def to_num_scalar(x: Any) -> float:
-    try:
-        v = pd.to_numeric(pd.Series([x]), errors="coerce").iloc[0]
-    except Exception:
-        v = np.nan
-
-    return v
-
-
-def coerce_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    out = df.copy()
-
-    for c in cols:
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
-
-    return out
-
-
-def safe_nullable_int(series: pd.Series) -> pd.Series:
-    s = pd.to_numeric(series, errors="coerce")
-    non_null = s.dropna()
-
-    if non_null.empty:
-        return s.astype("Int64")
-
-    if np.isclose(non_null % 1, 0).all():
-        return s.round().astype("Int64")
-
-    return s
-
-
-def normalize_person_name(x: Any) -> Optional[str]:
-    if pd.isna(x):
+def normalize_bearer_token(raw_token: Optional[str]) -> Optional[str]:
+    if raw_token is None:
         return None
 
-    x = str(x).strip().lower()
-    x = re.sub(r"[^a-z0-9 ]+", "", x)
-    x = re.sub(r"\s+", " ", x).strip()
+    token = str(raw_token).strip()
 
-    return x if x else None
+    if not token:
+        return None
 
+    if token.lower().startswith("bearer "):
+        return token
 
-def mode_or_first(s: pd.Series) -> Any:
-    s2 = s.dropna()
+    return f"Bearer {token}"
 
-    if len(s2) == 0:
-        return pd.NA
 
-    mode = s2.mode()
+RAW_PLL_TOKEN = (
+    os.getenv("PLL_BEARER_TOKEN")
+    or os.getenv("PLL_API_TOKEN")
+    or os.getenv("PLL_TOKEN")
+)
 
-    if len(mode) > 0:
-        return mode.iloc[0]
+PLL_BEARER_TOKEN = normalize_bearer_token(RAW_PLL_TOKEN)
 
-    return s2.iloc[0]
+SESSION = requests.Session()
 
+SESSION.headers.update({
+    "accept": "application/json, text/plain, */*",
+    "content-type": "application/json",
+    "user-agent": "PLL-Data-Platform/1.0",
+})
 
-def latest_non_null_by_game(g: pd.DataFrame, col: str) -> Any:
-    if col not in g.columns:
-        return pd.NA
+if PLL_BEARER_TOKEN:
+    SESSION.headers.update({
+        "authorization": PLL_BEARER_TOKEN,
+    })
 
-    sort_cols = [c for c in ["season", "game_number", "game_id"] if c in g.columns]
 
-    if sort_cols:
-        s = g.sort_values(sort_cols)[col].dropna()
-    else:
-        s = g[col].dropna()
-
-    if len(s) == 0:
-        return pd.NA
-
-    return s.iloc[-1]
-
-
-def extract_game_number_from_slug(slug: Any) -> Any:
-    if pd.isna(slug):
-        return pd.NA
-
-    slug = str(slug)
-
-    m1 = re.search(r"_game_(\d+)$", slug)
-    if m1:
-        return int(m1.group(1))
-
-    m2 = re.search(r"^game-(\d+)-\d{4}-\d{2}-\d{2}$", slug)
-    if m2:
-        return int(m2.group(1))
-
-    m3 = re.search(r"^(\d{4})-ev-(\d+)$", slug)
-    if m3:
-        return int(m3.group(2))
-
-    return pd.NA
-
-
-def extract_home_team_obj(data: dict[str, Any]) -> dict[str, Any]:
-    return data.get("homeTeam", {}) or {}
-
-
-def extract_away_team_obj(data: dict[str, Any]) -> dict[str, Any]:
-    for key in ["visitorTeam", "awayTeam", "visitor", "away"]:
-        obj = data.get(key, {}) or {}
-        if obj:
-            return obj
-
-    return {}
-
-
-def extract_team_id_from_obj(obj: Any) -> Any:
-    if not isinstance(obj, dict):
-        return pd.NA
-
-    return obj.get("officialId") or obj.get("teamId") or obj.get("id")
-
-
-def extract_team_name_from_obj(obj: Any) -> Any:
-    if not isinstance(obj, dict):
-        return pd.NA
-
-    return (
-        obj.get("name")
-        or obj.get("fullName")
-        or obj.get("teamName")
-        or obj.get("nickname")
-        or obj.get("officialId")
-        or obj.get("teamId")
-        or obj.get("id")
-    )
-
-
-# ============================================================
-# EVENT PAYLOAD / FIELD HELPERS
-# ============================================================
-
-def validate_event_payload(payload: Any, season: int) -> dict[str, Any]:
-    data = safe_get(payload, "data", default={}) if payload else {}
-
-    year_val = to_num_scalar(data.get("year"))
-    event_id = data.get("eventId")
-    event_numeric_id = data.get("id")
-    season_segment = data.get("seasonSegment")
-    slugname = data.get("slugname")
-    start_time_unix = to_num_scalar(data.get("startTime"))
-    event_status = data.get("eventStatus")
-
-    valid = bool(
-        not pd.isna(year_val)
-        and int(year_val) == int(season)
-        and event_id
-        and season_segment == COMPETITION_TYPE
-    )
-
-    return {
-        "valid": valid,
-        "year": None if pd.isna(year_val) else int(year_val),
-        "event_id": event_id,
-        "event_numeric_id": event_numeric_id,
-        "competition_type": season_segment,
-        "slugname": slugname,
-        "start_time_unix": None if pd.isna(start_time_unix) else int(start_time_unix),
-        "event_status": event_status,
-    }
-
-
-def recursive_leaf_pairs(obj: Any, prefix: str = "") -> list[tuple[str, Any]]:
-    pairs: list[tuple[str, Any]] = []
-
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            p = f"{prefix}.{k}" if prefix else str(k)
-            pairs.extend(recursive_leaf_pairs(v, p))
-
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj):
-            p = f"{prefix}[{i}]"
-            pairs.extend(recursive_leaf_pairs(v, p))
-
-    else:
-        pairs.append((prefix, obj))
-
-    return pairs
-
-
-def find_numeric_leaf_candidates(
-    obj: Any,
-    normalized_terms: list[str],
-) -> list[tuple[str, float]]:
-    pairs = recursive_leaf_pairs(obj)
-    out: list[tuple[str, float]] = []
-
-    for raw_path, val in pairs:
-        path_norm = snake_case(raw_path)
-
-        if all(term in path_norm for term in normalized_terms):
-            num = to_num_scalar(val)
-
-            if not pd.isna(num):
-                out.append((raw_path, num))
-
-    return out
-
-
-def coalesce_numeric_with_alt(
-    item: dict[str, Any],
-    direct_keys: list[str],
-    alt_term_groups: list[list[str]],
-    allow_zero: bool = True,
-) -> float:
-    for k in direct_keys:
-        if k in item:
-            val = to_num_scalar(item.get(k))
-
-            if not pd.isna(val):
-                if allow_zero or val != 0:
-                    return val
-
-    for term_group in alt_term_groups:
-        cands = find_numeric_leaf_candidates(item, term_group)
-
-        if cands:
-            cands_sorted = sorted(cands, key=lambda x: (x[1] == 0, len(x[0])))
-            best_val = cands_sorted[0][1]
-
-            if allow_zero or best_val != 0:
-                return best_val
-
-    return np.nan
-
-
-def derive_one_point_goals(
-    total_goals: Any,
-    raw_one_point_goals: Any,
-    two_point_goals: Any,
-) -> Any:
-    tg = to_num_scalar(total_goals)
-    rg = to_num_scalar(raw_one_point_goals)
-    tw = to_num_scalar(two_point_goals)
-
-    if not pd.isna(tg) and not pd.isna(tw):
-        calc = tg - tw
-
-        if pd.isna(rg) or not np.isclose(rg, calc):
-            return calc
-
-    return rg
-
-
-def derive_scoring_points(one_point_goals: Any, two_point_goals: Any) -> float:
-    one = to_num_scalar(one_point_goals)
-    two = to_num_scalar(two_point_goals)
-
-    if pd.isna(one) and pd.isna(two):
-        return np.nan
-
-    return (0 if pd.isna(one) else one) + 2 * (0 if pd.isna(two) else two)
-
-
-def derive_player_points(
-    raw_points: Any,
-    scoring_points: Any,
-    assists: Any,
-) -> Any:
-    rp = to_num_scalar(raw_points)
-    sp = to_num_scalar(scoring_points)
-    ast = to_num_scalar(assists)
-
-    if not pd.isna(sp) and not pd.isna(ast):
-        calc = sp + ast
-
-        if pd.isna(rp) or not np.isclose(rp, calc):
-            return calc
-
-    return rp
-
-
-# ============================================================
-# RATE / ROLLING HELPERS
-# ============================================================
-
-def add_rate_columns(
-    df: pd.DataFrame,
-    denominator_col: str = "games",
-    suffix: str = "_per_game",
-    exclude_cols: Optional[set[str]] = None,
-) -> pd.DataFrame:
-    if df is None or len(df) == 0:
-        return df
-
-    out = df.copy()
-
-    if denominator_col not in out.columns:
-        return out
-
-    if exclude_cols is None:
-        exclude_cols = set()
-
-    denominator = pd.to_numeric(out[denominator_col], errors="coerce").replace(0, np.nan)
-
-    numeric_cols = [
-        c for c in out.columns
-        if c not in exclude_cols
-        and c != denominator_col
-        and pd.api.types.is_numeric_dtype(out[c])
-    ]
-
-    for c in numeric_cols:
-        rate_col = f"{c}{suffix}"
-
-        if rate_col not in out.columns:
-            out[rate_col] = pd.to_numeric(out[c], errors="coerce") / denominator
-
-    return out
-
-
-def safe_divide(numerator: Any, denominator: Any) -> Any:
-    n = pd.to_numeric(numerator, errors="coerce")
-    d = pd.to_numeric(denominator, errors="coerce")
-
-    return n / d.replace(0, np.nan)
-
-
-def add_standard_player_rates(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or len(df) == 0:
-        return df
-
-    out = df.copy()
-
-    if "games" in out.columns:
-        games = pd.to_numeric(out["games"], errors="coerce").replace(0, np.nan)
-
-        rate_pairs = {
-            "points": "points_per_game",
-            "scoring_points": "scoring_points_per_game",
-            "one_point_goals": "one_point_goals_per_game",
-            "two_point_goals": "two_point_goals_per_game",
-            "goals": "goals_per_game",
-            "assists": "assists_per_game",
-            "shots": "shots_per_game",
-            "shots_on_goal": "shots_on_goal_per_game",
-            "two_point_shots": "two_point_shots_per_game",
-            "ground_balls": "ground_balls_per_game",
-            "turnovers": "turnovers_per_game",
-            "caused_turnovers": "caused_turnovers_per_game",
-            "faceoffs_won": "faceoffs_won_per_game",
-            "faceoffs_lost": "faceoffs_lost_per_game",
-            "faceoffs": "faceoffs_per_game",
-            "saves": "saves_per_game",
-            "clean_saves": "clean_saves_per_game",
-            "messy_saves": "messy_saves_per_game",
-            "scores_against": "scores_against_per_game",
-            "goals_against": "goals_against_per_game",
-            "touches": "touches_per_game",
-            "total_passes": "total_passes_per_game",
-            "penalties": "penalties_per_game",
-            "penalty_time": "penalty_time_per_game",
-        }
-
-        for total_col, rate_col in rate_pairs.items():
-            if total_col in out.columns:
-                out[rate_col] = pd.to_numeric(out[total_col], errors="coerce") / games
-
-    if "shots" in out.columns and "goals" in out.columns:
-        out["shot_pct_calc"] = safe_divide(out["goals"], out["shots"])
-
-    if "shots_on_goal" in out.columns and "shots" in out.columns:
-        out["shots_on_goal_rate_calc"] = safe_divide(out["shots_on_goal"], out["shots"])
-
-    if "faceoffs_won" in out.columns and "faceoffs" in out.columns:
-        out["faceoff_pct_calc"] = safe_divide(out["faceoffs_won"], out["faceoffs"])
-
-    if "saves" in out.columns:
-        if "goals_against" in out.columns:
-            ga = pd.to_numeric(out["goals_against"], errors="coerce")
-        elif "scores_against" in out.columns:
-            ga = pd.to_numeric(out["scores_against"], errors="coerce")
-        else:
-            ga = pd.Series(np.nan, index=out.index)
-
-        saves = pd.to_numeric(out["saves"], errors="coerce")
-        out["save_pct_calc"] = (saves / (saves + ga).replace(0, np.nan)).clip(0, 1)
-
-    return out
-
-
-def add_standard_team_rates(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or len(df) == 0:
-        return df
-
-    out = df.copy()
-
-    if "games" in out.columns:
-        games = pd.to_numeric(out["games"], errors="coerce").replace(0, np.nan)
-
-        rate_pairs = {
-            "scores": "scores_per_game",
-            "goals": "goals_per_game",
-            "one_point_goals": "one_point_goals_per_game",
-            "two_point_goals": "two_point_goals_per_game",
-            "assists": "assists_per_game",
-            "shots": "shots_per_game",
-            "shots_on_goal": "shots_on_goal_per_game",
-            "two_point_shots": "two_point_shots_per_game",
-            "ground_balls": "ground_balls_per_game",
-            "turnovers": "turnovers_per_game",
-            "caused_turnovers": "caused_turnovers_per_game",
-            "saves": "saves_per_game",
-            "faceoffs_won": "faceoffs_won_per_game",
-            "faceoffs_lost": "faceoffs_lost_per_game",
-            "faceoffs": "faceoffs_per_game",
-            "touches": "touches_per_game",
-            "total_passes": "total_passes_per_game",
-            "time_in_possession": "time_in_possession_per_game",
-            "offensive_sequence_proxy": "offensive_sequence_proxy_per_game",
-            "total_possessions": "total_possessions_per_game",
-            "official_total_possessions": "official_total_possessions_per_game",
-        }
-
-        for total_col, rate_col in rate_pairs.items():
-            if total_col in out.columns:
-                out[rate_col] = pd.to_numeric(out[total_col], errors="coerce") / games
-
-    if "shots" in out.columns and "goals" in out.columns:
-        out["shot_pct_calc"] = safe_divide(out["goals"], out["shots"])
-
-    if "shots_on_goal" in out.columns and "shots" in out.columns:
-        out["shots_on_goal_rate_calc"] = safe_divide(out["shots_on_goal"], out["shots"])
-
-    if "faceoffs_won" in out.columns and "faceoffs" in out.columns:
-        out["faceoff_pct_calc"] = safe_divide(out["faceoffs_won"], out["faceoffs"])
-
-    if "total_clears" in out.columns and "clear_attempts" in out.columns:
-        out["clear_pct_calc"] = safe_divide(out["total_clears"], out["clear_attempts"])
-
-    if "scores" in out.columns and "offensive_sequence_proxy" in out.columns:
-        out["scores_per_offensive_sequence_proxy"] = safe_divide(
-            out["scores"],
-            out["offensive_sequence_proxy"],
+def require_api_token() -> None:
+    if not PLL_BEARER_TOKEN:
+        raise RuntimeError(
+            "PLL API token is missing. Add repository secret PLL_BEARER_TOKEN "
+            "with value formatted as either 'Bearer <token>' or '<token>'."
         )
 
-    return out
 
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-# ============================================================
-# TABLE EXPORT HELPERS
-# ============================================================
-
-def ensure_non_empty_schema(df: Any, table_name: str) -> pd.DataFrame:
-    """
-    DuckDB cannot read Parquet files with zero columns.
-    This guarantees every exported table has at least one column.
-    """
-
-    if df is None:
-        return pd.DataFrame({
-            "_empty_table_name": [table_name],
-            "_note": ["table_was_none"],
-        })
-
-    if not isinstance(df, pd.DataFrame):
-        return pd.DataFrame({
-            "_empty_table_name": [table_name],
-            "_note": ["not_a_dataframe"],
-        })
-
-    if len(df.columns) == 0:
-        return pd.DataFrame(columns=[
-            "_empty_table_name",
-            "_note",
-            "season",
-            "game_slug",
-            "reason",
-            "error",
-        ])
-
-    return df
-
-
-def write_table_artifacts(
-    name: str,
-    df: pd.DataFrame,
-    artifact_rows: list[dict[str, Any]],
-) -> pd.DataFrame:
-    df_safe = ensure_non_empty_schema(df, name)
-
-    parquet_path = CURATED_ALL_DIR / f"{name}.parquet"
-    csv_path = CURATED_ALL_DIR / f"{name}.csv"
-
-    df_safe.to_parquet(parquet_path, index=False)
-    df_safe.to_csv(csv_path, index=False)
-
-    artifact_rows.append({
-        "table_name": name,
-        "rows": len(df_safe),
-        "columns": len(df_safe.columns),
-        "parquet_path": str(parquet_path.relative_to(REPO_ROOT)) if parquet_path.is_relative_to(REPO_ROOT) else str(parquet_path),
-        "csv_path": str(csv_path.relative_to(REPO_ROOT)) if csv_path.is_relative_to(REPO_ROOT) else str(csv_path),
-        "updated_at_utc": now_utc_iso(),
-    })
-
-    return df_safe
-
-
-def duckdb_load_parquet(
-    con: duckdb.DuckDBPyConnection,
-    schema_name: str,
-    table_name: str,
-) -> None:
-    fp = CURATED_ALL_DIR / f"{table_name}.parquet"
-
-    if not fp.exists():
-        print(f"Skipping missing file: {fp}")
-        return
-
-    con.execute(f"CREATE SCHEMA IF NOT EXISTS {schema_name};")
-
-    sql = (
-        f"CREATE OR REPLACE TABLE {schema_name}.{table_name} AS "
-        f"SELECT * FROM read_parquet('{fp.as_posix()}');"
-    )
-
-    con.execute(sql)
-
-
-# ============================================================
-# QC HELPERS
-# ============================================================
-
-quality_rows: list[dict[str, Any]] = []
-
-
-def add_qc_check(
-    check_name: str,
-    status: str,
-    actual: Any = None,
-    expected: Any = None,
-    notes: str = "",
-) -> None:
-    quality_rows.append({
-        "check_name": check_name,
-        "status": status,
-        "actual": actual,
-        "expected": expected,
-        "notes": notes,
-        "run_id": RUN_ID,
-        "checked_at_utc": now_utc_iso(),
-    })
-
-
-# ============================================================
-# STARTUP LOGGING
-# ============================================================
 
 def print_startup_summary() -> None:
     print("=" * 90)
@@ -1006,17 +188,1106 @@ def print_startup_summary() -> None:
     print("Force recollect:", FORCE_RECOLLECT)
     print("Force rediscover:", FORCE_REDISCOVER)
     print("Token loaded:", bool(PLL_BEARER_TOKEN))
-    print("Token preview:", token_preview(PLL_BEARER_TOKEN))
+    print("Token preview:", "SET" if PLL_BEARER_TOKEN else "MISSING")
     print("Authorization header present:", "authorization" in SESSION.headers)
     print("=" * 90)
 
 
-def require_api_token() -> None:
-    if not PLL_BEARER_TOKEN:
-        raise RuntimeError(
-            "PLL_BEARER_TOKEN is missing. Add it as a GitHub Actions secret "
-            "or set it as an environment variable before running the builder."
+# ============================================================
+# QUALITY CHECK TRACKING
+# ============================================================
+
+quality_rows: list[dict[str, Any]] = []
+
+
+def add_qc_check(
+    check_name: str,
+    status: str,
+    actual: Any = None,
+    expected: Any = None,
+    notes: str = "",
+) -> None:
+    quality_rows.append({
+        "check_name": str(check_name),
+        "status": str(status),
+        "actual": actual,
+        "expected": expected,
+        "notes": str(notes),
+        "run_id": RUN_ID,
+        "checked_at_utc": now_utc_iso(),
+    })
+
+
+# ============================================================
+# TEAM CANONICALIZATION
+# ============================================================
+
+TEAM_ID_CANONICAL_MAP = {
+    "ARC": "ARC",
+    "ARCHERS": "ARC",
+
+    "ATL": "ATL",
+    "ATS": "ATL",
+    "ATLAS": "ATL",
+
+    "BOS": "CAN",
+    "BOSTON": "CAN",
+    "CAN": "CAN",
+    "CANNONS": "CAN",
+    "BOSTON CANNONS": "CAN",
+
+    "CHA": "CHA",
+    "CHS": "CHA",
+    "CHAOS": "CHA",
+
+    "CHR": "CHR",
+    "CHROME": "CHR",
+
+    "OUT": "OUT",
+    "DEN": "OUT",
+    "DENVER": "OUT",
+    "OUTLAWS": "OUT",
+    "DENVER OUTLAWS": "OUT",
+
+    "RED": "RED",
+    "RW": "RED",
+    "REDWOODS": "RED",
+
+    "WAT": "WAT",
+    "WD": "WAT",
+    "WATERDOGS": "WAT",
+
+    "WHP": "WHP",
+    "WHI": "WHP",
+    "WSN": "WHP",
+    "WHIPSNAKES": "WHP",
+}
+
+TEAM_NAME_CANONICAL_MAP = {
+    "ARC": "Archers",
+    "ATL": "Atlas",
+    "CAN": "Cannons",
+    "CHA": "Chaos",
+    "CHR": "Chrome",
+    "OUT": "Outlaws",
+    "RED": "Redwoods",
+    "WAT": "Waterdogs",
+    "WHP": "Whipsnakes",
+}
+
+TEAM_DISPLAY_NAME_LOOKUP = {
+    "ARC": "Archers",
+    "ATL": "Atlas",
+    "CAN": "Cannons",
+    "CHA": "Chaos",
+    "CHR": "Chrome",
+    "OUT": "Outlaws",
+    "RED": "Redwoods",
+    "WAT": "Waterdogs",
+    "WHP": "Whipsnakes",
+}
+
+TEAM_NAME_LOOKUP_RAW = {
+    "ARC": "Archers",
+    "ATL": "Atlas",
+    "BOS": "Boston Cannons",
+    "CAN": "Cannons",
+    "CHA": "Chaos",
+    "CHR": "Chrome",
+    "OUT": "Outlaws",
+    "DEN": "Denver Outlaws",
+    "RED": "Redwoods",
+    "WAT": "Waterdogs",
+    "WHP": "Whipsnakes",
+    "WHI": "Whipsnakes",
+}
+
+
+def canonical_team_id(value: Any) -> Any:
+    if value is None or pd.isna(value):
+        return pd.NA
+
+    raw = str(value).strip()
+
+    if raw == "":
+        return pd.NA
+
+    key = re.sub(r"[^A-Za-z0-9]+", " ", raw).strip().upper()
+
+    if key in TEAM_ID_CANONICAL_MAP:
+        return TEAM_ID_CANONICAL_MAP[key]
+
+    compact = key.replace(" ", "")
+
+    if compact in TEAM_ID_CANONICAL_MAP:
+        return TEAM_ID_CANONICAL_MAP[compact]
+
+    for name_key, team_id in TEAM_ID_CANONICAL_MAP.items():
+        if name_key in key or key in name_key:
+            return team_id
+
+    return compact[:12]
+
+
+def canonical_team_name(team_id: Any, fallback_name: Any = None) -> Any:
+    tid = canonical_team_id(team_id)
+
+    if tid is not pd.NA and not pd.isna(tid):
+        tid_str = str(tid)
+
+        if tid_str in TEAM_NAME_CANONICAL_MAP:
+            return TEAM_NAME_CANONICAL_MAP[tid_str]
+
+    if fallback_name is not None and not pd.isna(fallback_name):
+        fallback = str(fallback_name).strip()
+
+        if fallback:
+            fallback_key = fallback.upper()
+            fallback_tid = canonical_team_id(fallback_key)
+
+            if fallback_tid is not pd.NA and not pd.isna(fallback_tid):
+                fallback_tid_str = str(fallback_tid)
+
+                if fallback_tid_str in TEAM_NAME_CANONICAL_MAP:
+                    return TEAM_NAME_CANONICAL_MAP[fallback_tid_str]
+
+            return fallback
+
+    return pd.NA
+
+
+# ============================================================
+# STRING / NAME HELPERS
+# ============================================================
+
+def clean_text(value: Any) -> Any:
+    if value is None or pd.isna(value):
+        return pd.NA
+
+    text = str(value)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if text.lower() in {"", "nan", "none", "null", "<na>"}:
+        return pd.NA
+
+    return text
+
+
+def normalize_person_name(value: Any) -> Any:
+    if value is None or pd.isna(value):
+        return pd.NA
+
+    text = str(value).strip()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[^\w\s\-\.'’]", "", text, flags=re.UNICODE)
+    text = text.replace("’", "'").strip()
+
+    suffix_pattern = r"\b(JR|SR|II|III|IV|V)\.?\b$"
+    text = re.sub(suffix_pattern, "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"\s+", " ", text)
+
+    if text == "":
+        return pd.NA
+
+    return text.title()
+
+
+def slugify(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return ""
+
+    text = str(value).strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    text = re.sub(r"-+", "-", text).strip("-")
+
+    return text
+
+
+def stable_hash(value: Any, n: int = 12) -> str:
+    text = json.dumps(value, sort_keys=True, default=str)
+    return hashlib.md5(text.encode("utf-8")).hexdigest()[:n]
+
+
+def safe_str(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+
+    try:
+        if pd.isna(value):
+            return default
+    except Exception:
+        pass
+
+    return str(value)
+
+
+# ============================================================
+# NUMERIC HELPERS
+# ============================================================
+
+def safe_numeric(series_or_value: Any) -> Any:
+    return pd.to_numeric(series_or_value, errors="coerce")
+
+
+def safe_nullable_int(series_or_value: Any) -> Any:
+    try:
+        return pd.to_numeric(series_or_value, errors="coerce").astype("Int64")
+    except Exception:
+        return series_or_value
+
+
+def safe_divide(numerator: Any, denominator: Any) -> Any:
+    num = pd.to_numeric(numerator, errors="coerce")
+    den = pd.to_numeric(denominator, errors="coerce")
+
+    if isinstance(num, pd.Series) or isinstance(den, pd.Series):
+        return num / den.replace(0, np.nan)
+
+    try:
+        if pd.isna(den) or float(den) == 0:
+            return np.nan
+        return num / den
+    except Exception:
+        return np.nan
+
+
+def parse_number(value: Any) -> Any:
+    if value is None:
+        return np.nan
+
+    try:
+        if pd.isna(value):
+            return np.nan
+    except Exception:
+        pass
+
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return value
+
+    text = str(value).strip()
+
+    if text == "":
+        return np.nan
+
+    text = text.replace(",", "")
+
+    if text.endswith("%"):
+        try:
+            return float(text[:-1]) / 100
+        except Exception:
+            return np.nan
+
+    try:
+        if "." in text:
+            return float(text)
+        return int(text)
+    except Exception:
+        return np.nan
+
+
+# ============================================================
+# JSON / FILE HELPERS
+# ============================================================
+
+def ensure_parent(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def read_json_gz(path: Path) -> Any:
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json_gz(path: Path, obj: Any) -> None:
+    ensure_parent(path)
+
+    with gzip.open(path, "wt", encoding="utf-8") as f:
+        json.dump(obj, f, default=str)
+
+
+def load_json_gz(path: Path) -> Any:
+    return read_json_gz(path)
+
+
+def save_json_gz(path: Path, obj: Any) -> None:
+    write_json_gz(path, obj)
+
+
+def read_json_file(path: Path) -> Any:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json_file(path: Path, obj: Any) -> None:
+    ensure_parent(path)
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, default=str)
+
+
+def as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        return value
+
+    if isinstance(value, tuple):
+        return list(value)
+
+    if isinstance(value, dict):
+        return [value]
+
+    try:
+        if pd.isna(value):
+            return []
+    except Exception:
+        pass
+
+    return [value]
+
+
+def get_nested(obj: Any, path: list[Any], default: Any = None) -> Any:
+    cur = obj
+
+    for key in path:
+        try:
+            if isinstance(cur, dict):
+                cur = cur[key]
+            elif isinstance(cur, list) and isinstance(key, int):
+                cur = cur[key]
+            else:
+                return default
+        except Exception:
+            return default
+
+    return cur
+
+
+def deep_find_key(obj: Any, target_key: str) -> list[Any]:
+    found: list[Any] = []
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if str(k) == target_key:
+                found.append(v)
+
+            found.extend(deep_find_key(v, target_key))
+
+    elif isinstance(obj, list):
+        for item in obj:
+            found.extend(deep_find_key(item, target_key))
+
+    return found
+
+
+def iter_dicts(obj: Any) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+
+    if isinstance(obj, dict):
+        rows.append(obj)
+
+        for value in obj.values():
+            rows.extend(iter_dicts(value))
+
+    elif isinstance(obj, list):
+        for item in obj:
+            rows.extend(iter_dicts(item))
+
+    return rows
+
+
+def flatten_json(obj: Any, parent_key: str = "", sep: str = "_") -> dict[str, Any]:
+    items: dict[str, Any] = {}
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            new_key = f"{parent_key}{sep}{k}" if parent_key else str(k)
+
+            if isinstance(v, dict):
+                items.update(flatten_json(v, new_key, sep=sep))
+            elif isinstance(v, list):
+                items[new_key] = json.dumps(v, default=str)
+            else:
+                items[new_key] = v
+
+    return items
+
+
+# ============================================================
+# API REQUEST HELPERS
+# ============================================================
+
+def api_get_json(
+    url: str,
+    params: Optional[dict[str, Any]] = None,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
+    max_retries: int = MAX_RETRIES,
+    sleep_seconds: float = REQUEST_SLEEP_SECONDS,
+) -> tuple[Optional[Any], dict[str, Any]]:
+    """
+    Performs a GET request and returns (json_payload, metadata).
+    """
+
+    meta = {
+        "url": url,
+        "params": json.dumps(params or {}, sort_keys=True, default=str),
+        "status_code": None,
+        "ok": False,
+        "error": None,
+        "fetched_at_utc": now_utc_iso(),
+    }
+
+    last_error = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            if sleep_seconds:
+                time.sleep(sleep_seconds)
+
+            response = SESSION.get(url, params=params, timeout=timeout)
+
+            meta["status_code"] = response.status_code
+
+            if response.status_code == 304:
+                meta["ok"] = True
+                meta["error"] = "not_modified"
+                return None, meta
+
+            if response.status_code in {429, 500, 502, 503, 504} and attempt < max_retries:
+                time.sleep(min(2 ** attempt, 10))
+                continue
+
+            response.raise_for_status()
+
+            try:
+                payload = response.json()
+            except Exception:
+                payload = json.loads(response.text)
+
+            meta["ok"] = True
+            return payload, meta
+
+        except Exception as exc:
+            last_error = str(exc)
+            meta["error"] = last_error
+
+            if attempt < max_retries:
+                time.sleep(min(2 ** attempt, 10))
+                continue
+
+    meta["ok"] = False
+    meta["error"] = last_error
+
+    return None, meta
+
+
+def get_json(
+    url: str,
+    params: Optional[dict[str, Any]] = None,
+) -> tuple[Optional[Any], dict[str, Any]]:
+    return api_get_json(url, params=params)
+
+
+def request_json(
+    url: str,
+    params: Optional[dict[str, Any]] = None,
+) -> tuple[Optional[Any], dict[str, Any]]:
+    return api_get_json(url, params=params)
+
+
+# ============================================================
+# AGGREGATION HELPERS
+# ============================================================
+
+def mode_or_first(series: pd.Series) -> Any:
+    s = series.dropna()
+
+    if len(s) == 0:
+        return pd.NA
+
+    mode = s.mode(dropna=True)
+
+    if len(mode) > 0:
+        return mode.iloc[0]
+
+    return s.iloc[0]
+
+
+def latest_non_null_by_game(df: pd.DataFrame, col: str) -> Any:
+    if df is None or len(df) == 0 or col not in df.columns:
+        return pd.NA
+
+    s = df[col].dropna()
+
+    if len(s) == 0:
+        return pd.NA
+
+    return s.iloc[-1]
+
+
+# ============================================================
+# RATE / DERIVED STAT HELPERS
+# ============================================================
+
+PLAYER_RATE_TOTALS = [
+    "points",
+    "scoring_points",
+    "one_point_goals",
+    "two_point_goals",
+    "goals",
+    "assists",
+    "shots",
+    "shots_on_goal",
+    "two_point_shots",
+    "ground_balls",
+    "turnovers",
+    "caused_turnovers",
+    "faceoffs_won",
+    "faceoffs_lost",
+    "faceoffs",
+    "saves",
+    "clean_saves",
+    "messy_saves",
+    "scores_against",
+    "goals_against",
+    "penalties",
+    "penalty_time",
+    "touches",
+    "total_passes",
+]
+
+TEAM_RATE_TOTALS = [
+    "scores",
+    "scoring_points",
+    "one_point_goals",
+    "two_point_goals",
+    "goals",
+    "assists",
+    "shots",
+    "shots_on_goal",
+    "two_point_shots",
+    "ground_balls",
+    "turnovers",
+    "caused_turnovers",
+    "saves",
+    "faceoffs_won",
+    "faceoffs_lost",
+    "faceoffs",
+    "total_clears",
+    "failed_clears",
+    "clear_attempts",
+    "touches",
+    "total_passes",
+    "time_in_possession",
+    "total_possessions",
+    "official_total_possessions",
+    "offensive_sequence_proxy",
+    "scores_against",
+    "goals_against",
+    "shots_against",
+    "shots_on_goal_against",
+    "touches_against",
+    "total_passes_against",
+    "offensive_sequence_proxy_against",
+]
+
+
+def add_per_game_columns(
+    df: pd.DataFrame,
+    totals: list[str],
+    games_col: str = "games",
+) -> pd.DataFrame:
+    out = df.copy()
+
+    if games_col not in out.columns:
+        return out
+
+    games = pd.to_numeric(out[games_col], errors="coerce").replace(0, np.nan)
+
+    for col in totals:
+        if col in out.columns:
+            out[f"{col}_per_game"] = pd.to_numeric(out[col], errors="coerce") / games
+
+    return out
+
+
+def add_standard_player_rates(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return df
+
+    out = df.copy()
+
+    out = add_per_game_columns(out, PLAYER_RATE_TOTALS, "games")
+
+    if "shots" in out.columns and "goals" in out.columns:
+        out["shot_pct_calc"] = safe_divide(out["goals"], out["shots"])
+        out["shot_pct"] = out["shot_pct_calc"]
+
+    if "shots" in out.columns and "shots_on_goal" in out.columns:
+        out["shots_on_goal_rate_calc"] = safe_divide(out["shots_on_goal"], out["shots"])
+
+    if "faceoffs_won" in out.columns and "faceoffs" in out.columns:
+        out["faceoff_pct_calc"] = safe_divide(out["faceoffs_won"], out["faceoffs"])
+        out["faceoff_pct"] = out["faceoff_pct_calc"]
+    elif "faceoffs_won" in out.columns and "faceoffs_lost" in out.columns:
+        out["faceoffs"] = (
+            pd.to_numeric(out["faceoffs_won"], errors="coerce").fillna(0)
+            + pd.to_numeric(out["faceoffs_lost"], errors="coerce").fillna(0)
         )
+        out["faceoff_pct_calc"] = safe_divide(out["faceoffs_won"], out["faceoffs"])
+        out["faceoff_pct"] = out["faceoff_pct_calc"]
+
+    if "saves" in out.columns:
+        saves = pd.to_numeric(out["saves"], errors="coerce")
+
+        if "goals_against" in out.columns:
+            ga = pd.to_numeric(out["goals_against"], errors="coerce")
+        elif "scores_against" in out.columns:
+            ga = pd.to_numeric(out["scores_against"], errors="coerce")
+        else:
+            ga = pd.Series(np.nan, index=out.index)
+
+        out["save_pct_calc"] = (saves / (saves + ga).replace(0, np.nan)).clip(0, 1)
+        out["save_pct"] = out["save_pct_calc"]
+
+    if "points" in out.columns and "touches" in out.columns:
+        out["points_per_touch"] = safe_divide(out["points"], out["touches"])
+
+    if "scoring_points" in out.columns and "touches" in out.columns:
+        out["scoring_points_per_touch"] = safe_divide(out["scoring_points"], out["touches"])
+
+    return out
+
+
+def add_standard_team_rates(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return df
+
+    out = df.copy()
+
+    out = add_per_game_columns(out, TEAM_RATE_TOTALS, "games")
+
+    if "shots" in out.columns and "goals" in out.columns:
+        out["shot_pct_calc"] = safe_divide(out["goals"], out["shots"])
+        out["shot_pct"] = out["shot_pct_calc"]
+
+    if "shots" in out.columns and "scores" in out.columns:
+        out["scores_per_shot"] = safe_divide(out["scores"], out["shots"])
+
+    if "shots" in out.columns and "shots_on_goal" in out.columns:
+        out["shots_on_goal_rate_calc"] = safe_divide(out["shots_on_goal"], out["shots"])
+
+    if "faceoffs_won" in out.columns and "faceoffs" in out.columns:
+        out["faceoff_pct_calc"] = safe_divide(out["faceoffs_won"], out["faceoffs"])
+        out["faceoff_pct"] = out["faceoff_pct_calc"]
+    elif "faceoffs_won" in out.columns and "faceoffs_lost" in out.columns:
+        out["faceoffs"] = (
+            pd.to_numeric(out["faceoffs_won"], errors="coerce").fillna(0)
+            + pd.to_numeric(out["faceoffs_lost"], errors="coerce").fillna(0)
+        )
+        out["faceoff_pct_calc"] = safe_divide(out["faceoffs_won"], out["faceoffs"])
+        out["faceoff_pct"] = out["faceoff_pct_calc"]
+
+    if "total_clears" in out.columns and "clear_attempts" in out.columns:
+        out["clear_pct_calc"] = safe_divide(out["total_clears"], out["clear_attempts"])
+        out["clear_pct"] = out["clear_pct_calc"]
+
+    if "saves" in out.columns:
+        saves = pd.to_numeric(out["saves"], errors="coerce")
+
+        if "goals_against" in out.columns:
+            ga = pd.to_numeric(out["goals_against"], errors="coerce")
+        elif "scores_against" in out.columns:
+            ga = pd.to_numeric(out["scores_against"], errors="coerce")
+        else:
+            ga = pd.Series(np.nan, index=out.index)
+
+        out["save_pct_proxy"] = (saves / (saves + ga).replace(0, np.nan)).clip(0, 1)
+        out["def_save_pct_proxy"] = out["save_pct_proxy"]
+
+    if "time_in_possession" in out.columns:
+        out["time_in_possession_mmss"] = out["time_in_possession"].apply(seconds_to_mmss_safe)
+
+    if "time_in_possession_per_game" in out.columns:
+        out["time_in_possession_per_game_mmss"] = out["time_in_possession_per_game"].apply(seconds_to_mmss_safe)
+        out["possession_pg"] = out["time_in_possession_per_game_mmss"]
+
+    return out
+
+
+def seconds_to_mmss_safe(value: Any) -> Any:
+    try:
+        seconds = int(round(float(value)))
+    except Exception:
+        return pd.NA
+
+    if seconds < 0:
+        return pd.NA
+
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def fill_team_opponent_stats_from_pair(team_game_stats: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each two-row game/team table, fills *_against fields from the opponent row
+    when those fields are absent or blank.
+
+    This is important because final records, defensive marts, matchup review,
+    and team style profiles should be based on final scores and real opponent stats.
+    """
+
+    if team_game_stats is None or len(team_game_stats) == 0:
+        return pd.DataFrame()
+
+    out = team_game_stats.copy()
+
+    required_keys = ["season", "game_id", "team_id", "opponent_team_id"]
+
+    if not all(c in out.columns for c in required_keys):
+        return out
+
+    stat_pairs = [
+        "scores",
+        "scoring_points",
+        "one_point_goals",
+        "two_point_goals",
+        "goals",
+        "assists",
+        "shots",
+        "shots_on_goal",
+        "two_point_shots",
+        "ground_balls",
+        "turnovers",
+        "caused_turnovers",
+        "saves",
+        "faceoffs_won",
+        "faceoffs_lost",
+        "faceoffs",
+        "total_clears",
+        "failed_clears",
+        "clear_attempts",
+        "touches",
+        "total_passes",
+        "time_in_possession",
+        "time_in_possession_pct",
+        "total_possessions",
+        "official_total_possessions",
+        "offensive_sequence_proxy",
+    ]
+
+    stat_pairs = [c for c in stat_pairs if c in out.columns]
+
+    if not stat_pairs:
+        return out
+
+    pair_source_cols = ["season", "game_id", "team_id"] + stat_pairs
+    pair_source = out[pair_source_cols].copy()
+
+    rename_map = {"team_id": "opponent_team_id"}
+
+    for stat in stat_pairs:
+        rename_map[stat] = f"{stat}_against_pair"
+
+    pair_source = pair_source.rename(columns=rename_map)
+
+    out = out.merge(
+        pair_source,
+        on=["season", "game_id", "opponent_team_id"],
+        how="left",
+    )
+
+    for stat in stat_pairs:
+        against_col = f"{stat}_against"
+        pair_col = f"{stat}_against_pair"
+
+        if pair_col not in out.columns:
+            continue
+
+        if against_col not in out.columns:
+            out[against_col] = out[pair_col]
+        else:
+            out[against_col] = out[against_col].where(out[against_col].notna(), out[pair_col])
+
+        out = out.drop(columns=[pair_col])
+
+    return out
+
+
+# ============================================================
+# STORAGE / ARTIFACT HELPERS
+# ============================================================
+
+def make_unique_storage_columns(columns: list[Any]) -> list[str]:
+    """
+    Ensures all output column names are strings and unique before writing CSV/parquet.
+    """
+
+    seen: dict[str, int] = {}
+    clean_cols: list[str] = []
+
+    for col in columns:
+        base = str(col)
+
+        if base not in seen:
+            seen[base] = 0
+            clean_cols.append(base)
+        else:
+            seen[base] += 1
+            clean_cols.append(f"{base}_{seen[base] + 1}")
+
+    return clean_cols
+
+
+def sanitize_dataframe_for_storage(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Converts a DataFrame into a parquet-safe and DuckDB-safe shape.
+
+    Main protections:
+    - pyarrow cannot write columns with mixed Python types, such as ints and strings.
+    - QC tables often mix values like 0, '>0 rows', and 'file_exists' in one column.
+    - Empty compatibility tables need at least one placeholder column for clean DuckDB load.
+    """
+
+    if df is None:
+        return pd.DataFrame({"_empty_placeholder": pd.Series(dtype="string")})
+
+    out = df.copy()
+
+    if len(out.columns) == 0:
+        return pd.DataFrame({"_empty_placeholder": pd.Series(dtype="string")})
+
+    out.columns = make_unique_storage_columns(list(out.columns))
+
+    def storage_scalar(value: Any) -> Any:
+        if value is None:
+            return None
+
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+
+        if isinstance(value, (dict, list, tuple, set)):
+            try:
+                return json.dumps(value, default=str, sort_keys=True)
+            except Exception:
+                return str(value)
+
+        if isinstance(value, (pd.Timestamp, datetime, date)):
+            return value.isoformat()
+
+        return value
+
+    for col in out.columns:
+        s = out[col]
+
+        if pd.api.types.is_datetime64_any_dtype(s):
+            continue
+
+        if pd.api.types.is_bool_dtype(s):
+            out[col] = s.astype("boolean")
+            continue
+
+        if pd.api.types.is_integer_dtype(s):
+            out[col] = s.astype("Int64")
+            continue
+
+        if pd.api.types.is_float_dtype(s):
+            out[col] = pd.to_numeric(s, errors="coerce")
+            continue
+
+        if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s) or isinstance(s.dtype, pd.CategoricalDtype):
+            mapped = s.map(storage_scalar)
+            non_null = mapped.dropna()
+
+            if len(non_null) == 0:
+                out[col] = mapped.astype("string")
+                continue
+
+            numeric_types = (int, float, np.integer, np.floating)
+
+            if non_null.map(lambda x: isinstance(x, numeric_types) and not isinstance(x, bool)).all():
+                numeric = pd.to_numeric(mapped, errors="coerce")
+
+                if len(numeric.dropna()) > 0 and numeric.dropna().map(lambda x: float(x).is_integer()).all():
+                    out[col] = numeric.astype("Int64")
+                else:
+                    out[col] = numeric
+
+                continue
+
+            if non_null.map(lambda x: isinstance(x, (bool, np.bool_))).all():
+                out[col] = mapped.astype("boolean")
+                continue
+
+            out[col] = mapped.astype("string")
+            continue
+
+        try:
+            out[col] = s.map(storage_scalar).astype("string")
+        except Exception:
+            out[col] = s.astype("string")
+
+    return out
+
+
+def write_table_artifacts(
+    table_name: str,
+    df: pd.DataFrame,
+    artifact_rows: list[dict[str, Any]],
+) -> None:
+    """
+    Writes one table to curated CSV + parquet artifacts.
+
+    This version is intentionally defensive because production builds can create
+    mixed-type QC columns and empty compatibility tables.
+    """
+
+    CURATED_ALL_DIR.mkdir(parents=True, exist_ok=True)
+
+    df_safe = sanitize_dataframe_for_storage(df)
+
+    csv_path = CURATED_ALL_DIR / f"{table_name}.csv"
+    parquet_path = CURATED_ALL_DIR / f"{table_name}.parquet"
+
+    df_safe.to_csv(csv_path, index=False)
+    df_safe.to_parquet(parquet_path, index=False)
+
+    artifact_rows.append({
+        "table_name": table_name,
+        "rows": int(len(df_safe)),
+        "columns": int(len(df_safe.columns)),
+        "csv_path": str(csv_path),
+        "parquet_path": str(parquet_path),
+        "written_at_utc": now_utc_iso(),
+    })
+
+
+def duckdb_load_parquet(
+    con: duckdb.DuckDBPyConnection,
+    schema_name: str,
+    table_name: str,
+) -> None:
+    parquet_path = CURATED_ALL_DIR / f"{table_name}.parquet"
+
+    if not parquet_path.exists():
+        empty_df = pd.DataFrame({"_missing_artifact": pd.Series(dtype="string")})
+        write_table_artifacts(table_name, empty_df, [])
+
+    con.execute(f"CREATE SCHEMA IF NOT EXISTS {schema_name};")
+
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE {schema_name}.{table_name} AS
+        SELECT *
+        FROM read_parquet('{parquet_path.as_posix()}');
+        """
+    )
+
+
+# ============================================================
+# BASIC DATAFRAME CLEANUP HELPERS
+# ============================================================
+
+def standardize_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return df
+
+    out = df.copy()
+
+    def clean_col(c: Any) -> str:
+        text = str(c).strip()
+        text = re.sub(r"[^A-Za-z0-9]+", "_", text)
+        text = re.sub(r"_+", "_", text).strip("_").lower()
+        return text
+
+    out.columns = make_unique_storage_columns([clean_col(c) for c in out.columns])
+
+    return out
+
+
+def drop_all_null_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return df
+
+    return df.dropna(axis=1, how="all")
+
+
+def coalesce_columns(df: pd.DataFrame, output_col: str, candidates: list[str]) -> pd.DataFrame:
+    out = df.copy()
+
+    if output_col not in out.columns:
+        out[output_col] = pd.NA
+
+    for c in candidates:
+        if c in out.columns:
+            out[output_col] = out[output_col].where(out[output_col].notna(), out[c])
+
+    return out
+
+
+def first_existing_col(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+
+    return None
+
+
+# ============================================================
+# GAME / ID HELPERS
+# ============================================================
+
+def build_game_id(season: Any, slug_or_number: Any) -> str:
+    season_str = safe_str(season, "unknown")
+    slug = slugify(slug_or_number)
+
+    if not slug:
+        slug = stable_hash(slug_or_number)
+
+    return f"{season_str}_{slug}"
+
+
+def normalize_game_number(value: Any) -> Any:
+    if value is None:
+        return pd.NA
+
+    try:
+        if pd.isna(value):
+            return pd.NA
+    except Exception:
+        pass
+
+    text = str(value)
+
+    match = re.search(r"(\d+)", text)
+
+    if not match:
+        return pd.NA
+
+    try:
+        return int(match.group(1))
+    except Exception:
+        return pd.NA
+
+
+def normalize_date_utc(value: Any) -> Any:
+    if value is None:
+        return pd.NA
+
+    try:
+        if pd.isna(value):
+            return pd.NA
+    except Exception:
+        pass
+
+    try:
+        return pd.to_datetime(value, utc=True, errors="coerce").date().isoformat()
+    except Exception:
+        return pd.NA
 
 
 # ============================================================
