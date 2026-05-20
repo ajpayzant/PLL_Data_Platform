@@ -1,15 +1,9 @@
-team_id,team_name,team_display_name,is_current_team
-ARC,Archers,Utah Archers,1
-ATL,Atlas,New York Atlas,1
-ASH,Baptiste,Baptiste,1
-CAN,Cannons,Boston Cannons,1
-CHA,Chaos,Carolina Chaos,1
-ASE,East,East,1
-ASA,Farrell,Farrell,1
-OUT,Outlaws,Denver Outlaws,1
-RED,Redwoods,California Redwoods,1
-WAT,Waterdogs,Philadelphia Waterdogs,1
-ASW,West,West,1
-WHP,Whipsnakes,Maryland Whipsnakes,1
-RIS,,,1
-VET,,,1
+team_id,team_name,team_display_name
+ARC,Archers,Utah Archers
+ATL,Atlas,New York Atlas
+CAN,Cannons,Boston Cannons
+CHA,Chaos,Carolina Chaos
+OUT,Outlaws,Denver Outlaws
+RED,Redwoods,California Redwoods
+WAT,Waterdogs,Philadelphia Waterdogs
+WHP,Whipsnakes,Maryland Whipsnakes
