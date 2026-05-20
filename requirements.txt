@@ -1,0 +1,11 @@
+pandas
+numpy
+requests
+tenacity
+tqdm
+pyarrow
+duckdb
+fastparquet
+openpyxl
+streamlit
+plotly
