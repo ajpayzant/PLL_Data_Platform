@@ -4107,6 +4107,55 @@ if "player_season_stats" in globals() and len(player_season_stats) > 0 and "seas
 
 player_ranking_profiles = pd.concat(ranking_contexts, ignore_index=True, sort=False) if ranking_contexts else pd.DataFrame()
 
+# ============================================================
+# TEAM STYLE PROFILE SCORING HELPERS
+# ============================================================
+
+def _minmax_score(values, higher_is_better=True):
+    """
+    Convert a numeric Series into a 0-100 min-max score.
+
+    higher_is_better=True:
+        lowest value -> 0
+        highest value -> 100
+
+    higher_is_better=False:
+        lowest value -> 100
+        highest value -> 0
+
+    If the column is empty, all missing, or has no spread, return neutral 50s.
+    This matches the team style profile logic used by the Streamlit app/testing
+    notebook and prevents small-context sections from crashing.
+    """
+    s = pd.to_numeric(values, errors="coerce")
+
+    out = pd.Series(np.nan, index=s.index, dtype="float64")
+
+    valid = s.dropna()
+
+    if valid.empty:
+        return pd.Series(50.0, index=s.index, dtype="float64")
+
+    min_val = valid.min()
+    max_val = valid.max()
+
+    if pd.isna(min_val) or pd.isna(max_val) or max_val == min_val:
+        return pd.Series(50.0, index=s.index, dtype="float64")
+
+    if higher_is_better:
+        out = 100.0 * (s - min_val) / (max_val - min_val)
+    else:
+        out = 100.0 * (max_val - s) / (max_val - min_val)
+
+    return out.clip(lower=0, upper=100).fillna(50.0)
+
+
+def _safe_minmax_score(values, higher_is_better=True):
+    """
+    Alias wrapper in case later consolidated code references the safe name.
+    """
+    return _minmax_score(values, higher_is_better)
+
 def _build_team_style_context(team_stats, defense_stats, context_type, context_label, sort_order):
     if team_stats is None or len(team_stats) == 0:
         return pd.DataFrame()
