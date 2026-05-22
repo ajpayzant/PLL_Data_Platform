@@ -18,7 +18,7 @@ DB_PATH = os.getenv("PLL_DB_PATH", os.path.join(DATA_DIR, "analytics_database", 
 ARTIFACT_INDEX_PATH = os.getenv("PLL_ARTIFACT_INDEX_PATH", os.path.join(DATA_DIR, "curated_data", "all_requested_seasons", "artifact_index.csv"))
 
 st.set_page_config(
-    page_title="PLL Data Platform",
+    page_title="PLL Analytics",
     page_icon="🥍",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -2022,8 +2022,8 @@ except Exception as e:
 # SIDEBAR
 # ============================================================
 
-st.sidebar.title("PLL Data Platform")
-st.sidebar.caption("Interactive test dashboard")
+st.sidebar.title("PLL Analytics")
+st.sidebar.caption("Interactive PLL Data Dashboard")
 
 st.sidebar.divider()
 
@@ -2366,15 +2366,15 @@ def _pll_final_ranking_explanation():
 # APP HEADER
 # ============================================================
 
-st.title("PLL Data Platform")
-st.caption("Player, team, season, matchup, specialty, schedule, and data-quality dashboard.")
+st.title("PLL Analytics")
+st.caption("Player Rankings, Team Profiles, Matchup Research, and Trading Intelligence")
 
 tabs = st.tabs([
     "Overview",
     "Season Dashboard",
     "Matchup Preview",
-    "Player Profiles",
     "Team Profiles",
+    "Player Profiles",
     "Specialists",
     "Compare Players",
     "Compare Teams",
